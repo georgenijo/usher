@@ -28,6 +28,12 @@ type Context struct {
 	Identity identity.Identity
 	Backend  string
 	Dir      Direction
+
+	// Inflight correlates a request to its response (id → method/tool). The
+	// inbound pump records into it; outbound stages that must act on a specific
+	// response kind (TrimStage on tools/call results) consume from it. Nil-safe:
+	// stages check for nil before use.
+	Inflight *InflightMap
 }
 
 // Stage is one step in the middleware pipeline. Process may inspect or transform

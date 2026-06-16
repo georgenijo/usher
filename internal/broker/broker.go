@@ -59,11 +59,15 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 
 	client := mcp.NewConn(in, out)
 
+	// One correlation map per connection: the inbound pump records id→method,
+	// the outbound pump's stages consume it to recognize the response kind.
+	inflight := NewInflightMap()
+
 	// Pump each direction in its own goroutine.
 	inboundDone := make(chan error, 1)  // client → backend ended
 	outboundDone := make(chan error, 1) // backend → client ended
-	go func() { inboundDone <- b.pump(id, be.Name, Inbound, client, sb.Conn(), b.inbound) }()
-	go func() { outboundDone <- b.pump(id, be.Name, Outbound, sb.Conn(), client, b.outbound) }()
+	go func() { inboundDone <- b.pump(id, be.Name, Inbound, inflight, client, sb.Conn(), b.inbound) }()
+	go func() { outboundDone <- b.pump(id, be.Name, Outbound, inflight, sb.Conn(), client, b.outbound) }()
 
 	select {
 	case <-ctx.Done():
@@ -89,13 +93,20 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 
 // pump reads from src, runs the pipeline, and writes survivors to dst. A
 // per-message pipeline error is logged and skipped; a read/write error ends the
-// pump (and the connection).
-func (b *Broker) pump(id identity.Identity, beName string, dir Direction, src, dst *mcp.Conn, pipe *Pipeline) error {
-	pctx := &Context{Identity: id, Backend: beName, Dir: dir}
+// pump (and the connection). On the inbound side it records each request's
+// method into inflight so outbound stages can correlate the response.
+func (b *Broker) pump(id identity.Identity, beName string, dir Direction, inflight *InflightMap, src, dst *mcp.Conn, pipe *Pipeline) error {
+	pctx := &Context{Identity: id, Backend: beName, Dir: dir, Inflight: inflight}
 	for {
 		m, err := src.Read()
 		if err != nil {
 			return err
+		}
+		if dir == Inbound && m.IsRequest() {
+			inflight.Record(m.IDString(), InflightEntry{
+				Method:   m.Method,
+				ToolName: toolNameIf(m),
+			})
 		}
 		out, err := pipe.Run(pctx, m)
 		if err != nil {
