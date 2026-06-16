@@ -17,7 +17,9 @@ func outboundCtx(inflight *InflightMap) *Context {
 
 // fatAXResult returns the raw JSON of a tools/call result whose text content is
 // a large AX snapshot (image item first, text item second — the cua-driver SOM
-// layout), and the marshaled mcp.Message for id.
+// layout), and the marshaled mcp.Message for id. The returned message has its
+// Raw set to the full wire bytes, exactly as Conn.Read would produce it, so
+// pass-through tests can assert byte-for-byte Raw preservation.
 func fatAXResult(t *testing.T, id string) *mcp.Message {
 	t.Helper()
 	var sb strings.Builder
@@ -49,7 +51,21 @@ func fatAXResult(t *testing.T, id string) *mcp.Message {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage(id), Result: rb}
+	return withWireRaw(t, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage(id), Result: rb})
+}
+
+// withWireRaw populates m.Raw with the full marshaled message bytes, mimicking a
+// message that came off the wire via Conn.Read (where Raw holds the exact line).
+// Pass-through code paths must forward those bytes verbatim, so tests use the
+// returned wire bytes to assert Raw is preserved byte-for-byte.
+func withWireRaw(t *testing.T, m *mcp.Message) *mcp.Message {
+	t.Helper()
+	wire, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Raw = wire
+	return m
 }
 
 func TestTrimStage_TrimsLargeGetWindowState(t *testing.T) {
@@ -112,15 +128,18 @@ func TestTrimStage_PassThruToolsList(t *testing.T) {
 	// schema description must NOT be trimmed.
 	raw := json.RawMessage(`{"tools":[{"name":"get_window_state","description":"Walk the AXWindow tree ` +
 		strings.Repeat("x", 5000) + `","inputSchema":{"type":"object"}}]}`)
-	m := &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("2"), Result: raw}
+	m := withWireRaw(t, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("2"), Result: raw})
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 
 	out, err := NewTrimStage().Process(outboundCtx(f), m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil {
-		t.Error("tools/list must pass through with Raw intact (byte-identical)")
+	// Raw must survive byte-for-byte so Conn.Write forwards the exact bytes; a
+	// stage that wrongly cleared Raw on a tools/list pass-through is caught here.
+	if string(out.Raw) != string(origRaw) {
+		t.Errorf("tools/list Raw must pass through byte-identical:\n got: %s\nwant: %s", out.Raw, origRaw)
 	}
 	if string(out.Result) != string(orig) {
 		t.Error("tools/list result was modified")
@@ -152,16 +171,18 @@ func TestTrimStage_PassThruSmallResult(t *testing.T) {
 	f := NewInflightMap()
 	f.Record("3", InflightEntry{Method: "tools/call", ToolName: "click"})
 	// A small tools/call result (a click ack) — under the threshold, untouched.
+	// Note the AXWindow marker is present: only size keeps it under the threshold.
 	raw := json.RawMessage(`{"content":[{"type":"text","text":"clicked [5] AXWindow ok"}]}`)
-	m := &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("3"), Result: raw}
+	m := withWireRaw(t, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("3"), Result: raw})
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 
 	out, err := NewTrimStage().Process(outboundCtx(f), m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil || string(out.Result) != string(orig) {
-		t.Error("small result must pass through unchanged")
+	if string(out.Raw) != string(origRaw) || string(out.Result) != string(orig) {
+		t.Error("small result must pass through unchanged (Raw byte-identical)")
 	}
 }
 
@@ -173,15 +194,16 @@ func TestTrimStage_PassThruLargeNonAX(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"content": []any{map[string]any{"type": "text", "text": big}},
 	})
-	m := &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("4"), Result: raw}
+	m := withWireRaw(t, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage("4"), Result: raw})
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 
 	out, err := NewTrimStage().Process(outboundCtx(f), m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil || string(out.Result) != string(orig) {
-		t.Error("large non-AX result must pass through unchanged")
+	if string(out.Raw) != string(origRaw) || string(out.Result) != string(orig) {
+		t.Error("large non-AX result must pass through unchanged (Raw byte-identical)")
 	}
 }
 
@@ -190,14 +212,15 @@ func TestTrimStage_PassThruUncorrelated(t *testing.T) {
 	// before any inflight wiring, or a backend-initiated message) must pass.
 	f := NewInflightMap()
 	m := fatAXResult(t, "99")
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 
 	out, err := NewTrimStage().Process(outboundCtx(f), m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil || string(out.Result) != string(orig) {
-		t.Error("uncorrelated response must pass through unchanged")
+	if string(out.Raw) != string(origRaw) || string(out.Result) != string(orig) {
+		t.Error("uncorrelated response must pass through unchanged (Raw byte-identical)")
 	}
 }
 
@@ -205,6 +228,7 @@ func TestTrimStage_NotOnInbound(t *testing.T) {
 	f := NewInflightMap()
 	f.Record("7", InflightEntry{Method: "tools/call"})
 	m := fatAXResult(t, "7")
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 
 	ctx := &Context{Identity: identity.New(), Backend: "test", Dir: Inbound, Inflight: f}
@@ -212,22 +236,23 @@ func TestTrimStage_NotOnInbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil || string(out.Result) != string(orig) {
-		t.Error("inbound messages must never be trimmed")
+	if string(out.Raw) != string(origRaw) || string(out.Result) != string(orig) {
+		t.Error("inbound messages must never be trimmed (Raw byte-identical)")
 	}
 }
 
 func TestTrimStage_NilInflightSafe(t *testing.T) {
 	// A Context without an inflight map (defensive) passes everything through.
 	m := fatAXResult(t, "7")
+	origRaw := append([]byte(nil), m.Raw...)
 	orig := append([]byte(nil), m.Result...)
 	ctx := &Context{Identity: identity.New(), Backend: "test", Dir: Outbound}
 	out, err := NewTrimStage().Process(ctx, m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Raw != nil || string(out.Result) != string(orig) {
-		t.Error("nil inflight must be a safe pass-through")
+	if string(out.Raw) != string(origRaw) || string(out.Result) != string(orig) {
+		t.Error("nil inflight must be a safe pass-through (Raw byte-identical)")
 	}
 }
 

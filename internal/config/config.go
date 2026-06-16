@@ -23,6 +23,11 @@ type Backend struct {
 // Config is the whole usher state file.
 type Config struct {
 	Backends []Backend `json:"backends"`
+
+	// TrimThreshold is the per-text-item size (in bytes) above which the broker's
+	// trim stage compacts an oversized AX-tree digest. Zero (the unset default)
+	// means use the broker's built-in DefaultTrimThreshold.
+	TrimThreshold int `json:"trimThreshold,omitempty"`
 }
 
 // StateDir is usher's single state directory (config, socket, audit log).

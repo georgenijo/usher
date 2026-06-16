@@ -29,11 +29,16 @@ type Broker struct {
 // New builds a broker from config, logging audit to stderr.
 func New(cfg *config.Config) (*Broker, error) {
 	al := audit.New(os.Stderr)
+	// A zero (unset) config threshold means "use the built-in default".
+	trimThreshold := DefaultTrimThreshold
+	if cfg.TrimThreshold > 0 {
+		trimThreshold = cfg.TrimThreshold
+	}
 	return &Broker{
 		cfg:      cfg,
 		audit:    al,
 		inbound:  NewPipeline(NewGateStage(), NewArbitrateStage(), NewAuditStage(al, Inbound)),
-		outbound: NewPipeline(NewTrimStage(), NewAuditStage(al, Outbound)),
+		outbound: NewPipeline(NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
 	}, nil
 }
 

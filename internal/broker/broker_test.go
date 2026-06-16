@@ -108,6 +108,46 @@ func TestBroker_InboundRecordOutboundTrim(t *testing.T) {
 	}
 }
 
+// TestNew_TrimThresholdFromConfig verifies the on-disk Config.TrimThreshold is
+// wired into the outbound trim stage, and that a zero (unset) value falls back
+// to the built-in default.
+func TestNew_TrimThresholdFromConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  int
+		want int
+	}{
+		{"unset falls back to default", 0, DefaultTrimThreshold},
+		{"custom value is honored", 512, 512},
+		{"negative is treated as unset", -1, DefaultTrimThreshold},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := New(&config.Config{TrimThreshold: tc.cfg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts := outboundTrimStage(t, b)
+			if ts.threshold != tc.want {
+				t.Errorf("trim threshold = %d, want %d", ts.threshold, tc.want)
+			}
+		})
+	}
+}
+
+// outboundTrimStage extracts the broker's outbound TrimStage so a test can
+// inspect the threshold it was constructed with.
+func outboundTrimStage(t *testing.T, b *Broker) *TrimStage {
+	t.Helper()
+	for _, s := range b.outbound.stages {
+		if ts, ok := s.(*TrimStage); ok {
+			return ts
+		}
+	}
+	t.Fatal("outbound pipeline has no TrimStage")
+	return nil
+}
+
 // readAllMessages reads exactly n messages off conn, failing on early EOF.
 func readAllMessages(t *testing.T, conn *mcp.Conn, n int) []*mcp.Message {
 	t.Helper()

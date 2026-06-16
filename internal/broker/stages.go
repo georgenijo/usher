@@ -69,8 +69,9 @@ type TrimStage struct {
 // NewTrimStage returns a trim stage using the default threshold.
 func NewTrimStage() *TrimStage { return &TrimStage{threshold: DefaultTrimThreshold} }
 
-// NewTrimStageThreshold returns a trim stage with a custom size threshold,
-// for tests and future config wiring.
+// NewTrimStageThreshold returns a trim stage with a custom size threshold. The
+// broker wires Config.TrimThreshold through here (falling back to the default);
+// tests use it to exercise the compaction boundary directly.
 func NewTrimStageThreshold(threshold int) *TrimStage { return &TrimStage{threshold: threshold} }
 
 // Name identifies the stage.
