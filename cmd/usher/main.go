@@ -22,6 +22,7 @@ import (
 	"github.com/georgenijo/usher/internal/backend"
 	"github.com/georgenijo/usher/internal/broker"
 	"github.com/georgenijo/usher/internal/config"
+	"github.com/georgenijo/usher/internal/control"
 	"github.com/georgenijo/usher/internal/keychain"
 	"github.com/georgenijo/usher/internal/mcp"
 )
@@ -72,12 +73,12 @@ func usage() {
 
 usage:
   usher serve [--backend NAME]      proxy stdio MCP to a backend (the daemon)
-  usher serve --socket [--backend N] listen on the Unix socket (daemon foreground)
+  usher serve --socket [--backend N] listen on the Unix socket + loopback control UI
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
-  usher status                      print daemon status (running/stopped/stale)
+  usher status                      print daemon status (running/stopped/stale + UI url)
   usher install [--backend NAME]    install + load the launchd LaunchAgent
   usher uninstall                   unload + remove the launchd LaunchAgent
   usher backend list                show registered backends
@@ -135,6 +136,29 @@ func cmdServe(args []string) error {
 		_ = writePID(config.PidPath(), os.Getpid())
 		defer removePID(config.PidPath())
 		fmt.Fprintf(os.Stderr, "usher: listening on %s (pid %d)\n", config.SocketPath(), os.Getpid())
+
+		// Bring up the loopback control plane (REST + SSE + embedded UI) on the SAME
+		// shared backend pool the socket accept loop drives, so the UI's
+		// Start/Stop/Restart and a lazy come-live move one state machine. Build the
+		// supervisor here, hand it to the control server, and start the
+		// connection-level audit subscriber (the SSE stream is the bus's other
+		// reader). A control-plane bind failure is a warning, not fatal: the broker
+		// still serves MCP without the UI.
+		sv := b.EnsureSupervisor(ctx)
+		b.StartAuditSubscriber(ctx) // connection-level audit becomes a bus subscriber
+		ui := control.New(b.Bus(), sv, cfg)
+		ui.SetAddr(uiAddr())
+		if uiLn, lerr := ui.Listen(); lerr != nil {
+			fmt.Fprintf(os.Stderr, "usher: warning: control plane not started: %v\n", lerr)
+		} else {
+			go func() {
+				if serr := ui.Serve(ctx, uiLn); serr != nil {
+					fmt.Fprintf(os.Stderr, "usher: control plane stopped: %v\n", serr)
+				}
+			}()
+			fmt.Fprintf(os.Stderr, "usher: UI on http://%s\n", uiLn.Addr())
+		}
+
 		return b.ServeSocket(ctx, *backendName, ln)
 	}
 
@@ -145,6 +169,16 @@ func cmdServe(args []string) error {
 		return b.ServeMulti(ctx, names, os.Stdin, os.Stdout)
 	}
 	return b.ServeStdio(ctx, *backendName, os.Stdin, os.Stdout)
+}
+
+// uiAddr resolves the control-plane listen address: the USHER_UI_ADDR override
+// when set, else the package default. The control server validates it is loopback
+// before binding, so an override that names a routable host fails closed.
+func uiAddr() string {
+	if a := os.Getenv(control.EnvAddr); a != "" {
+		return a
+	}
+	return control.DefaultAddr
 }
 
 // splitBackends parses a "cua,fs" list into names, trimming blanks. An empty

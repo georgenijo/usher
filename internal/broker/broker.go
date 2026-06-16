@@ -47,6 +47,29 @@ func (b *Broker) Supervisor() *BackendSupervisor { return b.sv }
 // broker built by New.
 func (b *Broker) Bus() *Hub { return b.bus }
 
+// EnsureSupervisor builds the shared backend pool (if not already built) under
+// ctx and returns it, so the daemon can construct the control plane against the
+// SAME supervisor the socket accept loop drives. ServeSocket reuses whatever this
+// installed (it only builds one when b.sv is still nil), so the control plane and
+// the forwarding path share one pool — the UI's Start/Stop and a lazy come-live
+// move the same state machine. Idempotent: a second call returns the first pool.
+func (b *Broker) EnsureSupervisor(ctx context.Context) *BackendSupervisor {
+	if b.sv == nil {
+		b.sv = newSupervisorForBroker(ctx, b)
+	}
+	return b.sv
+}
+
+// StartAuditSubscriber wires the broker's audit logger to the event bus as ONE
+// subscriber, so connection-level lifecycle lines (connect / disconnect / backend
+// state transitions) become event-driven on the daemon path — the per-MESSAGE
+// wire log stays on AuditStage in the pipeline. It runs in its own goroutine and
+// returns when ctx is cancelled. The daemon calls it once on the socket path; the
+// SSE stream is the bus's other reader.
+func (b *Broker) StartAuditSubscriber(ctx context.Context) {
+	go RunAuditSubscriber(ctx, b.bus, b.audit)
+}
+
 // New builds a broker from config, logging audit to stderr.
 func New(cfg *config.Config) (*Broker, error) {
 	al := audit.New(os.Stderr)

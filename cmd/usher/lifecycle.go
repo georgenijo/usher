@@ -203,7 +203,7 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	if processAlive(pid) {
-		fmt.Printf("usher: running pid=%d socket=%s\n", pid, config.SocketPath())
+		fmt.Printf("usher: running pid=%d socket=%s ui=http://%s\n", pid, config.SocketPath(), uiAddr())
 		return nil
 	}
 	fmt.Printf("usher: stale pid file (pid=%d not running); run: usher stop\n", pid)

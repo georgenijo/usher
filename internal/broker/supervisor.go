@@ -464,6 +464,19 @@ func (sv *BackendSupervisor) Restart(name string) error {
 	return sv.Start(name)
 }
 
+// Find returns the current snapshot for a single backend by name plus whether it
+// exists. The control plane uses it both to answer "does this backend exist" (a
+// 404 versus a real action) and to read the new state after a lifecycle action,
+// without exposing the managedBackend or scanning the full Snapshot. It is the
+// exported, type-safe single-backend view of lookup.
+func (sv *BackendSupervisor) Find(name string) (BackendStatus, bool) {
+	mb, err := sv.lookup(name)
+	if err != nil {
+		return BackendStatus{}, false
+	}
+	return mb.snapshot(), true
+}
+
 // Snapshot returns the UI/CLI view of every backend in the pool, in config order
 // so the listing is stable.
 func (sv *BackendSupervisor) Snapshot() []BackendStatus {
