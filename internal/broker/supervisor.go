@@ -94,12 +94,18 @@ type managedBackend struct {
 	// is published per start attempt so a later retry has its own gate.
 	ready chan struct{}
 
-	// Cached handshake artifacts so a future per-client layer can answer each new
+	// Cached handshake artifacts so the per-client mux layer can answer each new
 	// client's initialize/tools/list WITHOUT re-initializing the shared child.
 	// initResult is the child's initialize result, serverInfo re-stamped to usher;
 	// toolsResult is the child's tools/list result, cached verbatim.
 	initResult  json.RawMessage
 	toolsResult json.RawMessage
+
+	// mux multiplexes many client connections onto this shared child (id-rewrite,
+	// response routing, the per-client cached initialize). It is built when the
+	// child goes live and torn down (set nil) when it stops or dies. Nil unless
+	// StateLive.
+	mux *backendMux
 
 	startedAt time.Time
 	refs      int // attached client connections (UI readout; idle-stop is deferred)
@@ -170,12 +176,27 @@ type BackendSupervisor struct {
 	cfg    *config.Config
 	bus    *Hub            // BackendState events; nil-safe
 	ctx    context.Context // daemon lifetime; children are spawned under it
+
+	// broker is the owning broker, used to build a backendMux for each live child
+	// (the mux needs the broker's pipelines, lock registry, and audit). It may be
+	// nil for a bare supervisor built directly in a test that never multiplexes
+	// clients (the lifecycle tests); startAndHandshake then skips the mux.
+	broker *Broker
 }
 
 // NewSupervisor pre-populates the pool from cfg.Backends, every backend
 // StateStopped (no children spawned). ctx is the daemon lifetime — every shared
-// child is spawned under it, so cancelling ctx tears the whole pool down.
+// child is spawned under it, so cancelling ctx tears the whole pool down. broker
+// owns the pipelines/locks the per-child mux uses to multiplex clients; pass nil
+// for a bare lifecycle-only supervisor (the mux is then never built).
 func NewSupervisor(ctx context.Context, cfg *config.Config, bus *Hub) *BackendSupervisor {
+	return newSupervisor(ctx, cfg, bus, nil)
+}
+
+// newSupervisor is the full constructor; NewSupervisor is the public form with a
+// nil broker. The daemon path uses newSupervisorForBroker so the per-child mux
+// can be built with the broker's pipelines and lock registry.
+func newSupervisor(ctx context.Context, cfg *config.Config, bus *Hub, broker *Broker) *BackendSupervisor {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -184,12 +205,20 @@ func NewSupervisor(ctx context.Context, cfg *config.Config, bus *Hub) *BackendSu
 		cfg:    cfg,
 		bus:    bus,
 		ctx:    ctx,
+		broker: broker,
 	}
 	for i := range cfg.Backends {
 		be := &cfg.Backends[i]
 		sv.byName[be.Name] = &managedBackend{cfg: be, bus: bus, state: StateStopped}
 	}
 	return sv
+}
+
+// newSupervisorForBroker builds the daemon-path supervisor wired to its owning
+// broker, so each live child gets a backendMux (built from the broker's
+// pipelines, lock registry, and audit) for client multiplexing.
+func newSupervisorForBroker(ctx context.Context, b *Broker) *BackendSupervisor {
+	return newSupervisor(ctx, b.cfg, b.bus, b)
 }
 
 // lookup returns the managedBackend for name, or an error when name is not a
@@ -339,12 +368,19 @@ func (sv *BackendSupervisor) startAndHandshake(mb *managedBackend) error {
 		return fmt.Errorf("backend %q tools/list error: %s", mb.cfg.Name, toolsResp.Error)
 	}
 
-	// Publish the started child + cached handshake under the lock.
+	// Publish the started child + cached handshake under the lock, and build the
+	// per-child mux so the daemon path can multiplex many clients onto this one
+	// shared conn. The mux owns the single outbound reader (readLoop), started in
+	// its own goroutine: there is exactly one reader because there is one conn.
 	mb.mu.Lock()
 	mb.child = sb
 	mb.conn = conn
 	mb.initResult = stampServerInfo(initResp.Result)
 	mb.toolsResult = append(json.RawMessage(nil), toolsResp.Result...)
+	if sv.broker != nil {
+		mb.mux = newBackendMux(mb, sv.broker, sv.bus)
+		go mb.mux.readLoop()
+	}
 	mb.mu.Unlock()
 	return nil
 }
@@ -406,6 +442,11 @@ func (sv *BackendSupervisor) Stop(name string) error {
 	mb.conn = nil
 	mb.initResult = nil
 	mb.toolsResult = nil
+	// Drop the mux: its readLoop sees the child's EOF and runs failAll, which (with
+	// the state already StateStopping) answers any outstanding routes with a
+	// backend-stopped error rather than flipping state to Failed. Clearing mb.mux
+	// here means a fresh come-live builds a new one.
+	mb.mux = nil
 	mb.refs = 0
 	mb.state = StateStopped
 	mb.emitStateLocked(StateStopping, StateStopped)

@@ -121,27 +121,30 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 }
 
 // ServeSocket runs the always-on daemon: it accepts connections on ln and
-// proxies each one through serveConn (a fresh identity, inflight map, and pump
-// pair). The process-wide lock registry arbitrates contention ACROSS
-// connections. ServeSocket returns when ctx is cancelled (it closes ln, which
-// unblocks Accept) or Accept fails for a non-shutdown reason.
+// multiplexes each one onto the SHARED backend child via serveMuxConn. Unlike the
+// legacy stdio path (ServeStdio→serveConn, which spawns a fresh child per
+// connection), the daemon path routes every connection through one supervised,
+// long-lived pool child — many agent connections share one backend, the inverse
+// of #17's fan-out. The process-wide lock registry arbitrates contention ACROSS
+// connections, which now matters more because they genuinely share the child.
+// ServeSocket returns when ctx is cancelled (it closes ln, which unblocks Accept)
+// or Accept fails for a non-shutdown reason.
 //
-// The daemon owns a shared BackendSupervisor (the pool): it is built here so the
-// control plane can list backends and drive their lifecycle, and the configured
-// backend is brought live through it on startup so the pool's state machine and
-// its BackendState events are the source of truth. Full client-multiplexing of
-// many connections onto the one shared child (the inverse of #17's fan-out) is
-// the mux layer that lands next; until then serveConn keeps the per-connection
-// proxy. The pool is torn down on return so no shared child is orphaned.
+// The daemon owns the shared BackendSupervisor (the pool): it is built here so
+// the control plane can list backends and drive their lifecycle, and the
+// configured backend is brought live through it on startup so the pool's state
+// machine and its BackendState events are the source of truth. The pool is torn
+// down on return so no shared child is orphaned.
 func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Listener) error {
 	defer ln.Close()
 
-	// Build the shared backend pool once per daemon and route the backend's
-	// lifecycle (come-live, state events) through it. EnsureLive lazily starts the
-	// shared child and runs its one-time handshake; a start failure is surfaced as
-	// a warning rather than aborting the daemon, since a later request can retry.
+	// Build the shared backend pool once per daemon, wired to this broker so each
+	// live child gets a backendMux for client multiplexing. EnsureLive lazily
+	// starts the shared child and runs its one-time handshake; a start failure is
+	// surfaced as a warning rather than aborting the daemon, since a later request
+	// can retry.
 	if b.sv == nil {
-		b.sv = NewSupervisor(ctx, b.cfg, b.bus)
+		b.sv = newSupervisorForBroker(ctx, b)
 	}
 	defer b.sv.StopAll()
 	if be := b.cfg.ResolveBackend(backendName); be != nil {
@@ -166,12 +169,11 @@ func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Lis
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
-		// One goroutine per connection: independent session, independent pumps.
-		// net.Conn is both io.Reader and io.Writer, and carries the peer creds.
-		go func(c net.Conn) {
-			defer c.Close()
-			_ = b.serveConn(ctx, backendName, c, c, c)
-		}(conn)
+		// One goroutine per connection, all multiplexed onto the shared child. Each
+		// connection keeps its own identity, inflight map, and window-lock ownership;
+		// serveMuxConn closes the conn on return. ctx is threaded so a daemon
+		// shutdown unblocks an idle client's blocking Read by closing its conn.
+		go b.serveMuxConn(ctx, backendName, conn)
 	}
 }
 

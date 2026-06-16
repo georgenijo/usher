@@ -19,7 +19,8 @@ import (
 
 // socketTestBroker builds a broker whose single backend is a re-exec of the test
 // binary as the fake MCP server (the same fakeBackendMain used by the fanout
-// tests). Each accepted socket connection spawns its OWN copy of this backend.
+// tests). On the daemon (socket) path every accepted connection is MULTIPLEXED
+// onto ONE shared, supervised backend child — not a fresh child per connection.
 func socketTestBroker(t *testing.T, name string, tools []string) *Broker {
 	t.Helper()
 	self, err := os.Executable()
@@ -73,11 +74,13 @@ func shortSockPath(t *testing.T) string {
 	return filepath.Join(dir, "u.sock")
 }
 
-// TestServeSocket_TwoConcurrentClients is the #20 done criterion: two clients
-// dialing the daemon's Unix socket each get an INDEPENDENT proxied session to
-// their own backend child. Both complete the MCP handshake (initialize +
-// tools/list) and the responses are valid and unmixed; cancelling the context
-// closes the listener and both connections see clean EOF.
+// TestServeSocket_TwoConcurrentClients is the daemon done criterion under the mux
+// model: two clients dialing the daemon's Unix socket are MULTIPLEXED onto ONE
+// shared backend child (not a child each), yet each still completes its own MCP
+// handshake (initialize + tools/list) with valid, unmixed responses correlated to
+// its own request ids. After both finish, the supervisor reports exactly one live
+// backend (the shared child). Cancelling the context closes the listener and the
+// pool; ServeSocket returns nil.
 func TestServeSocket_TwoConcurrentClients(t *testing.T) {
 	b := socketTestBroker(t, "fake", []string{"click", "type_text"})
 
@@ -145,9 +148,9 @@ func TestServeSocket_TwoConcurrentClients(t *testing.T) {
 		}
 	}
 
-	// Two clients concurrently. Independent sessions: each gets its own backend
-	// child and its own pump pair; the process-wide lock registry is the only
-	// shared state and is safe for concurrent use.
+	// Two clients concurrently. They SHARE one supervised backend child; each keeps
+	// its own identity, inflight map, and window-lock ownership, and the mux
+	// rewrites ids so neither client sees the other's traffic.
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
@@ -157,6 +160,20 @@ func TestServeSocket_TwoConcurrentClients(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	// The pool holds exactly one backend, and it is the single shared child both
+	// clients were multiplexed onto — live with its tools cached.
+	if sv := b.Supervisor(); sv == nil {
+		t.Fatal("daemon path did not build a supervisor")
+	} else {
+		snap := sv.Snapshot()
+		if len(snap) != 1 {
+			t.Fatalf("supervisor snapshot = %d backends, want 1 shared child", len(snap))
+		}
+		if snap[0].State != "live" {
+			t.Fatalf("shared backend state = %q, want live", snap[0].State)
+		}
+	}
 
 	// Shutdown: cancelling ctx closes the listener; ServeSocket returns nil.
 	cancel()
