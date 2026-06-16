@@ -121,13 +121,26 @@ func (m *mcpMessage) callText(t *testing.T) string {
 // tears the daemon and pool down.
 func startMuxDaemon(t *testing.T, tools []string) (sockPath string, cancel context.CancelFunc) {
 	t.Helper()
-	b := socketTestBroker(t, "fake", tools)
+	sockPath, cancel, _ = startMuxDaemonBroker(t, tools)
+	return sockPath, cancel
+}
+
+// startMuxDaemonBroker is startMuxDaemon plus the live *Broker, so a test can reach
+// the supervisor (e.g. drive Stop/Start concurrently with client traffic).
+func startMuxDaemonBroker(t *testing.T, tools []string) (sockPath string, cancel context.CancelFunc, b *Broker) {
+	t.Helper()
+	b = socketTestBroker(t, "fake", tools)
 	sockPath = shortSockPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	ctx, cancelFn := context.WithCancel(context.Background())
+	// Build the pool before launching ServeSocket — exactly as the daemon does
+	// (cmd/usher: EnsureSupervisor then ServeSocket) — so the supervisor pointer is
+	// installed with a happens-before the accept loop, and a test can reach it
+	// without racing the field write.
+	b.EnsureSupervisor(ctx)
 	srvDone := make(chan error, 1)
 	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln) }()
 	t.Cleanup(func() {
@@ -138,7 +151,7 @@ func startMuxDaemon(t *testing.T, tools []string) (sockPath string, cancel conte
 			t.Error("ServeSocket did not return after ctx cancel")
 		}
 	})
-	return sockPath, cancelFn
+	return sockPath, cancelFn, b
 }
 
 // TestMux_TwoClientsNoCrossTalk is the protocol-critical case: two clients share
@@ -321,4 +334,83 @@ func TestMux_DisconnectDoesNotDisturbOther(t *testing.T) {
 			t.Fatalf("client B response wrong after A disconnect: %q", got)
 		}
 	}
+}
+
+// TestMux_InitializeRacesStop pins the data race on mb.initResult: a UI Stop nils
+// mb.initResult under mb.mu while a freshly connecting client answers its
+// initialize from that same cache. serveMuxConn must snapshot initResult under the
+// lock, so this concurrent traffic produces no -race report. Many short-lived
+// clients each do a fresh handshake while the supervisor is hammered with
+// Stop/Start; each client must get either a valid initialize result or a clean
+// backend-stopped error — never a torn/half-read cache. The real assertion is the
+// race detector; the response check guards against a null-result regression.
+func TestMux_InitializeRacesStop(t *testing.T) {
+	sock, _, b := startMuxDaemonBroker(t, []string{"click"})
+	// startMuxDaemonBroker installs the pool before serving, so it is ready here.
+	sv := b.Supervisor()
+	if sv == nil {
+		t.Fatal("supervisor not constructed for socket daemon")
+	}
+
+	// Run sustained, overlapping reader and writer loops for a bounded window so the
+	// race window (a client reading mb.initResult while a Stop nils it) is hit many
+	// times rather than relying on one lucky interleave. The real assertion is -race;
+	// the response check guards against a null/empty result regression.
+	deadline := time.Now().Add(750 * time.Millisecond)
+	var wg sync.WaitGroup
+
+	// Writer side: several goroutines Stop the backend in a tight loop, each Stop
+	// nilling mb.initResult under mb.mu. The clients' initialize keep bringing it
+	// back live (EnsureLive), so the pool oscillates the whole window.
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				_ = sv.Stop("fake")
+			}
+		}()
+	}
+
+	// Reader side: several goroutines each dial, send initialize (triggering the
+	// come-live + the from-cache answer), and read the response — the read of
+	// mb.initResult is the racing side.
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				conn, err := net.Dial("unix", sock)
+				if err != nil {
+					continue // listener mid-churn; not what we're testing
+				}
+				_ = conn.SetDeadline(time.Now().Add(testDeadline))
+				rdr := bufio.NewReaderSize(conn, 1<<16)
+				if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")); err != nil {
+					_ = conn.Close()
+					continue
+				}
+				line, err := rdr.ReadBytes('\n')
+				if err != nil {
+					_ = conn.Close()
+					continue
+				}
+				var m mcpMessage
+				if json.Unmarshal([]byte(strings.TrimRight(string(line), "\r\n")), &m) == nil {
+					// A coherent answer is a non-empty result (live, cache snapshotted)
+					// OR an error (stopped). A null/empty result with no error is the
+					// race (a torn read of a concurrently-nilled cache).
+					if len(m.Result) == 0 && len(m.Error) == 0 {
+						t.Errorf("initialize got neither result nor error (torn cache read?): %s", line)
+					}
+					if string(m.Result) == "null" {
+						t.Errorf("initialize got result:null (initResult read raced Stop)")
+					}
+				}
+				_ = conn.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
 }

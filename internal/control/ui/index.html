@@ -91,6 +91,7 @@
 
 const $ = (id) => document.getElementById(id);
 const backends = new Map();      // name -> status object
+const stateEpoch = new Map();    // name -> monotonic counter, bumped per backend.state event
 const connections = new Map();   // connID -> conn object
 let feed = [];                   // recent activity rows (newest first)
 const FEED_MAX = 60;
@@ -251,14 +252,24 @@ function connect() {
 
   es.addEventListener("backend.state", (e) => {
     const d = JSON.parse(e.data);
+    // Bump this backend's epoch so a slower in-flight /api/backends fetch (issued
+    // for an EARLIER transition) cannot overwrite this newer SSE state with a
+    // stale snapshot — e.g. regressing a live badge back to starting.
+    const epoch = (stateEpoch.get(d.backend) || 0) + 1;
+    stateEpoch.set(d.backend, epoch);
     const b = backends.get(d.backend) || { name: d.backend };
     b.state = d.to;
     if (d.to !== "live") { b.startedAt = null; }
     backends.set(d.backend, b);
     renderBackends();
-    // A real transition refreshes counts/uptime from the authoritative list.
+    // A real transition refreshes counts/uptime from the authoritative list. Each
+    // row is only applied if no newer backend.state event has arrived for that
+    // backend since this fetch was issued (epoch guard).
     fetch("/api/backends").then((r) => r.json()).then((list) => {
-      for (const x of list) backends.set(x.name, x);
+      for (const x of list) {
+        if ((stateEpoch.get(x.name) || 0) > epoch) { continue; }
+        backends.set(x.name, x);
+      }
       renderBackends();
     }).catch(() => {});
     pushFeed({ time: fmtTime(d.ts), kind: "state", conn: "—", backend: d.backend,

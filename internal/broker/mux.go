@@ -438,14 +438,29 @@ func (b *Broker) serveMuxConn(ctx context.Context, backendName string, c net.Con
 			}
 			mb = live
 			attachOnce(mb, mc, &attached)
+			// Emit ConnOpen BEFORE writing the result so a UI subscriber that snapshots
+			// between attach and the write sees this connection in the registry, not
+			// just in the backend's ref count.
+			b.bus.Emit(ConnOpenEvent{TS: time.Now(), ConnID: id.ID, PID: id.PID, Backend: backendName})
 			// Answer the client's initialize from cache, stamped with ITS id. The
-			// shared child is never re-initialized.
+			// shared child is never re-initialized. Snapshot initResult under mb.mu so
+			// a concurrent Stop (which nils it under the same lock) cannot race the read
+			// and hand this client a torn cache. If a Stop nilled the cache between
+			// EnsureLive and this snapshot, initResult is empty — answer backend-stopped
+			// rather than write a malformed result-less message (the client's next
+			// request re-triggers come-live).
+			mb.mu.Lock()
+			initResult := append(json.RawMessage(nil), mb.initResult...)
+			mb.mu.Unlock()
+			if len(initResult) == 0 {
+				_ = client.Write(mcp.ErrorResponse(m.ID, ErrBackendStopped, "backend is not running"))
+				continue
+			}
 			_ = client.Write(&mcp.Message{
 				JSONRPC: "2.0",
 				ID:      append(json.RawMessage(nil), m.ID...),
-				Result:  append(json.RawMessage(nil), mb.initResult...),
+				Result:  initResult,
 			})
-			b.bus.Emit(ConnOpenEvent{TS: time.Now(), ConnID: id.ID, PID: id.PID, Backend: backendName})
 
 		case m.IsNotification() && m.Method == "notifications/initialized":
 			// Swallow per-client: the shared child already received its single
@@ -460,10 +475,16 @@ func (b *Broker) serveMuxConn(ctx context.Context, backendName string, c net.Con
 			}
 			// toolsResult is the child's FULL tools/list result object
 			// ({"tools":[...]}), cached verbatim by the supervisor — answered as-is
-			// (a fresh copy under this client's id). Do NOT re-wrap it.
+			// (a fresh copy under this client's id). Do NOT re-wrap it. As with
+			// initialize, a Stop racing between ensureMuxLive and this snapshot can nil
+			// the cache; an empty copy means backend-stopped, not an empty result.
 			live.mu.Lock()
 			tools := append(json.RawMessage(nil), live.toolsResult...)
 			live.mu.Unlock()
+			if len(tools) == 0 {
+				_ = client.Write(mcp.ErrorResponse(m.ID, ErrBackendStopped, "backend is not running"))
+				continue
+			}
 			_ = client.Write(&mcp.Message{
 				JSONRPC: "2.0",
 				ID:      append(json.RawMessage(nil), m.ID...),
