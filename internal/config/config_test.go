@@ -1,8 +1,10 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +110,10 @@ func TestConfigRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 
+	// The sentinel secret value: it is the kind of string that must NEVER reach
+	// config.json. We assert below that it does not appear in the raw bytes.
+	const secretValue = "sk-test"
+
 	in := &Config{
 		Backends: []Backend{
 			{Name: "cua", Transport: "stdio", Command: []string{"cua-driver", "mcp"}, Auth: "inherit", Default: true},
@@ -132,5 +138,20 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(db.EnvKeys, []string{"ANTHROPIC_API_KEY"}) {
 		t.Errorf("EnvKeys = %v, want [ANTHROPIC_API_KEY]", db.EnvKeys)
+	}
+
+	// Read the raw bytes and assert the secret VALUE never landed on disk. The
+	// Config struct has no field that holds a secret, but this explicit check
+	// catches a future regression that accidentally serialized one. The key NAME
+	// is expected to be present; the value is not.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(raw), secretValue) {
+		t.Errorf("config.json contains secret value %q; secrets must live only in the Keychain:\n%s", secretValue, raw)
+	}
+	if !strings.Contains(string(raw), "ANTHROPIC_API_KEY") {
+		t.Errorf("config.json missing the env key NAME; envKeys should be serialized:\n%s", raw)
 	}
 }

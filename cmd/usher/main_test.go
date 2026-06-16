@@ -67,15 +67,19 @@ func fakeBackendMain() {
 
 // fakeBackendCommand returns an argv that re-execs this test binary as the fake
 // MCP backend in the given mode. The mode + the re-exec flag are carried as
-// inline env on a /bin/sh wrapper so they don't pollute the test process.
+// inline env on a /bin/sh wrapper so they don't pollute the test process. The
+// path to re-exec is carried in USHER_FAKE_BIN rather than relying on POSIX
+// argument-zero ($0) semantics, making the intent explicit and shell-portable.
 func fakeBackendCommand(t *testing.T, mode string) []string {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "USHER_FAKE_BACKEND=1 USHER_FAKE_MODE=" + mode + ` exec "$0"`
-	return []string{"/bin/sh", "-c", script, self}
+	script := "USHER_FAKE_BIN='" + self + "'; " +
+		"USHER_FAKE_BACKEND=1 USHER_FAKE_MODE='" + mode + "' " +
+		`exec "$USHER_FAKE_BIN"`
+	return []string{"/bin/sh", "-c", script}
 }
 
 // TestProbeBackend table-drives probeBackend against the fake backend's modes.
@@ -120,9 +124,10 @@ func TestProbeBackend(t *testing.T) {
 }
 
 // TestBackendAddHandshakeProbe drives backendAdd end-to-end against an isolated
-// state dir: a valid backend registers with a successful probe; a backend that
-// cannot speak MCP still registers (advisory, non-fatal probe) and is persisted
-// to config.json. Neither path returns an error from backendAdd.
+// state dir, enforcing the done criterion "refuse to register if the handshake
+// fails": a valid backend registers with a successful probe (no error, persisted);
+// a backend that cannot speak MCP is REJECTED — backendAdd returns an error and
+// nothing is written to config.json.
 func TestBackendAddHandshakeProbe(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USHER_STATE_DIR", dir)
@@ -134,12 +139,11 @@ func TestBackendAddHandshakeProbe(t *testing.T) {
 		t.Fatalf("backendAdd(good) = %v, want nil", err)
 	}
 
-	// 2. A backend that exits immediately (`false` speaks no MCP): probe fails
-	//    but registration is non-fatal, so backendAdd still returns nil and the
-	//    backend is written to config.
+	// 2. A backend that exits immediately (`false` speaks no MCP): the handshake
+	//    fails, so backendAdd MUST return an error and MUST NOT persist it.
 	args = []string{"bad", "--auth", "inherit", "--", "/usr/bin/false"}
-	if err := backendAdd(args); err != nil {
-		t.Fatalf("backendAdd(bad) = %v, want nil (probe is advisory)", err)
+	if err := backendAdd(args); err == nil {
+		t.Fatal("backendAdd(bad) = nil, want error (handshake failure must refuse registration)")
 	}
 
 	cfg, err := config.Load(filepath.Join(dir, "config.json"))
@@ -149,12 +153,8 @@ func TestBackendAddHandshakeProbe(t *testing.T) {
 	if be := cfg.ResolveBackend("good"); be == nil {
 		t.Error("backend \"good\" not persisted")
 	}
-	bad := cfg.ResolveBackend("bad")
-	if bad == nil {
-		t.Fatal("backend \"bad\" not persisted despite advisory probe failure")
-	}
-	if len(bad.EnvKeys) != 0 {
-		t.Errorf("bad.EnvKeys = %v, want none (auth=inherit stores no secrets)", bad.EnvKeys)
+	if bad := cfg.ResolveBackend("bad"); bad != nil {
+		t.Errorf("backend \"bad\" was persisted despite a failed handshake: %+v", bad)
 	}
 }
 

@@ -268,27 +268,38 @@ func backendAdd(args []string) error {
 		EnvKeys:   []string(envKeys),
 	}
 	cfg.Add(be, *makeDefault)
-	if err := cfg.Save(path); err != nil {
-		return err
-	}
 
-	// Handshake-validate-on-add: spawn the backend and complete an MCP
-	// initialize, refusing to claim success if it fails. A probe failure is
-	// advisory, not fatal — the backend may be installed-but-not-yet-runnable
-	// (e.g. a key still to be added, an OAuth flow pending) and the user should
-	// still be able to register it. The config is already saved.
-	envExtra, err := config.EnvForBackend(cfg.ResolveBackend(name))
+	// Handshake-validate-BEFORE-save: the done criterion is "refuse to register
+	// if the handshake fails (with a clear message)." So we probe first and only
+	// persist a backend that actually speaks MCP — a handshake failure is fatal
+	// and the config is left untouched.
+	//
+	// The lone advisory exception is when the auth env cannot be resolved yet
+	// (e.g. a key not yet in the Keychain, an OAuth flow still pending). That is a
+	// legitimately pre-install state, not a broken backend, so we register
+	// without probing and tell the user how to verify later. We resolve against a
+	// transient copy that is added to cfg but NOT yet saved.
+	probeBe := cfg.ResolveBackend(name)
+	envExtra, err := config.EnvForBackend(probeBe)
 	if err != nil {
+		// Auth env not yet resolvable: register without probing (advisory).
+		if err := cfg.Save(path); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stderr, "usher: warning: cannot resolve auth env: %v\n", err)
 		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", name, name)
 		return nil
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := probeBackend(probeCtx, cfg.ResolveBackend(name), envExtra); err != nil {
-		fmt.Fprintf(os.Stderr, "usher: warning: handshake probe failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "usher: backend %q registered but may not work; verify with: usher backend probe %s\n", name, name)
-		return nil
+	if err := probeBackend(probeCtx, probeBe, envExtra); err != nil {
+		// Handshake failed: refuse to register and leave config untouched.
+		return fmt.Errorf("backend %q handshake failed, not registered: %w\n  (fix the command/key, then re-run: usher backend add %s ...)", name, err, name)
+	}
+
+	// Handshake ok — now persist.
+	if err := cfg.Save(path); err != nil {
+		return err
 	}
 	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
 	return nil
