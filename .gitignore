@@ -5,3 +5,6 @@
 # go
 *.test
 *.out
+
+# workflow scratch
+/.workflow/
