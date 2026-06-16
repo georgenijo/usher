@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 
@@ -70,8 +71,53 @@ func policyFromConfig(cfg *config.Config) Policy {
 }
 
 // ServeStdio bridges one agent (over in/out) to a backend until either side
-// closes. backendName empty selects the configured default.
+// closes. backendName empty selects the configured default. This is the local
+// path where the agent spawns `usher serve`, so the caller is this process: it
+// delegates to serveConn with a nil net.Conn, making PeerPID fall back to
+// os.Getpid().
 func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reader, out io.Writer) error {
+	return b.serveConn(ctx, backendName, nil, in, out)
+}
+
+// ServeSocket runs the always-on daemon: it accepts connections on ln and
+// proxies each one through its own serveConn (a fresh identity, backend child,
+// inflight map, and pump pair). The process-wide lock registry arbitrates
+// contention ACROSS connections. ServeSocket returns when ctx is cancelled (it
+// closes ln, which unblocks Accept) or Accept fails for a non-shutdown reason.
+func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Listener) error {
+	defer ln.Close()
+
+	// Close the listener on ctx cancel so the Accept loop unblocks and returns.
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// A closed listener (our own shutdown) is the expected exit, not an
+			// error to surface.
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accept: %w", err)
+		}
+		// One goroutine per connection: independent session, independent pumps.
+		// net.Conn is both io.Reader and io.Writer, and carries the peer creds.
+		go func(c net.Conn) {
+			defer c.Close()
+			_ = b.serveConn(ctx, backendName, c, c, c)
+		}(conn)
+	}
+}
+
+// serveConn is the per-connection core shared by ServeStdio (conn == nil) and
+// ServeSocket (conn == the accepted *net.UnixConn). It mints an identity from the
+// connection's peer credentials, spawns the backend, and pumps both directions
+// until either side closes or ctx is cancelled. in/out carry the JSON-RPC stream
+// (conn itself on the socket path; os.Stdin/os.Stdout on the stdio path).
+func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Conn, in io.Reader, out io.Writer) error {
 	be := b.cfg.ResolveBackend(backendName)
 	if be == nil {
 		return fmt.Errorf("no backend configured (run: usher backend add <name> -- <command...>)")
@@ -80,7 +126,7 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 		return fmt.Errorf("backend %q: transport %q not supported yet", be.Name, be.Transport)
 	}
 
-	id := identity.New()
+	id := identity.NewForConn(conn)
 	b.audit.Connect(id, be.Name)
 
 	// Resolve the auth strategy's env additions (Keychain-backed secrets for

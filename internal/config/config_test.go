@@ -38,6 +38,27 @@ func TestLockDurations(t *testing.T) {
 	}
 }
 
+// TestStateDirPaths asserts SocketPath and PidPath live inside the state dir
+// with the expected filenames, and that the USHER_STATE_DIR override is honored
+// (so tests and isolated runs never touch the real ~/.usher).
+func TestStateDirPaths(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	if got, want := StateDir(), dir; got != want {
+		t.Fatalf("StateDir() = %q, want %q", got, want)
+	}
+	if got, want := SocketPath(), filepath.Join(dir, "usher.sock"); got != want {
+		t.Errorf("SocketPath() = %q, want %q", got, want)
+	}
+	if got, want := PidPath(), filepath.Join(dir, "usher.pid"); got != want {
+		t.Errorf("PidPath() = %q, want %q", got, want)
+	}
+	if got, want := DefaultPath(), filepath.Join(dir, "config.json"); got != want {
+		t.Errorf("DefaultPath() = %q, want %q", got, want)
+	}
+}
+
 // TestEnvForBackend covers the auth-strategy → env-additions mapping. The env
 // strategy is exercised with an in-memory keychainGet so the test never touches
 // the real Keychain.

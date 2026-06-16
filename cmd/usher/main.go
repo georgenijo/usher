@@ -41,6 +41,16 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "start":
+		err = cmdStart(os.Args[2:])
+	case "stop":
+		err = cmdStop(os.Args[2:])
+	case "status":
+		err = cmdStatus(os.Args[2:])
+	case "install":
+		err = cmdInstall(os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -59,8 +69,14 @@ func usage() {
 
 usage:
   usher serve [--backend NAME]      proxy stdio MCP to a backend (the daemon)
+  usher serve --socket [--backend N] listen on the Unix socket (daemon foreground)
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
+  usher start [--backend NAME]      launch the daemon in the background
+  usher stop                        stop the background daemon
+  usher status                      print daemon status (running/stopped/stale)
+  usher install [--backend NAME]    install + load the launchd LaunchAgent
+  usher uninstall                   unload + remove the launchd LaunchAgent
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
@@ -85,6 +101,7 @@ func cmdServe(args []string) error {
 	backendName := fs.String("backend", "", "backend to route to (default: configured default)")
 	all := fs.Bool("all", false, "aggregate ALL configured backends behind one connection")
 	backends := fs.String("backends", "", "comma-separated backends to aggregate (e.g. cua,fs)")
+	socket := fs.Bool("socket", false, "listen on the Unix socket in the state dir (daemon foreground)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -100,6 +117,22 @@ func cmdServe(args []string) error {
 	b, err := broker.New(cfg)
 	if err != nil {
 		return err
+	}
+
+	// Socket mode is the always-on daemon: listen in the state dir and proxy many
+	// concurrent connections, each through its own pipeline pair (#20). It is
+	// additive — the stdio paths below are unchanged. (Multi-backend aggregation
+	// over the socket is a future combination; --socket routes to one backend.)
+	if *socket {
+		ln, err := listenUnix(config.SocketPath())
+		if err != nil {
+			return err
+		}
+		// Maintain a PID file for `usher status`, removed on clean shutdown.
+		_ = writePID(config.PidPath(), os.Getpid())
+		defer removePID(config.PidPath())
+		fmt.Fprintf(os.Stderr, "usher: listening on %s (pid %d)\n", config.SocketPath(), os.Getpid())
+		return b.ServeSocket(ctx, *backendName, ln)
 	}
 
 	// Multi-backend aggregation is opt-in and additive; the default path is the

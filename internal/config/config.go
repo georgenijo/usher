@@ -102,6 +102,16 @@ func StateDir() string {
 // DefaultPath is the config file location inside the state dir.
 func DefaultPath() string { return filepath.Join(StateDir(), "config.json") }
 
+// SocketPath is the Unix-domain socket the always-on daemon listens on (#20).
+// It lives inside the single state dir so every lifecycle command, the accept
+// loop, and the launchd plist generator agree on one location.
+func SocketPath() string { return filepath.Join(StateDir(), "usher.sock") }
+
+// PidPath is the daemon's PID file inside the state dir (#20). Its presence plus
+// a process-liveness check is how `usher status` distinguishes running from
+// stopped from stale, without a flock dependency.
+func PidPath() string { return filepath.Join(StateDir(), "usher.pid") }
+
 // cuaCommand is the default hands backend: the Cua Driver MCP server.
 func cuaCommand() []string {
 	home, err := os.UserHomeDir()
