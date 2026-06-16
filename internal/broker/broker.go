@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/georgenijo/usher/internal/audit"
 	"github.com/georgenijo/usher/internal/backend"
@@ -40,13 +41,32 @@ func New(cfg *config.Config) (*Broker, error) {
 	// connections — two agents driving the same window must serialise even
 	// though each has its own pair of pumps. Zero ttl/wait take the defaults.
 	locks := newLockRegistry(cfg.LockTTL(), cfg.LockWait())
+	// Build the gate policy from the built-in destructive-tool set plus any
+	// config additions, with config + env allow-lists as the override (#18).
+	policy := policyFromConfig(cfg)
 	return &Broker{
 		cfg:      cfg,
 		audit:    al,
 		locks:    locks,
-		inbound:  NewPipeline(NewGateStage(), NewArbitrateStage(), NewAuditStage(al, Inbound)),
+		inbound:  NewPipeline(NewGateStagePolicy(policy), NewArbitrateStage(), NewAuditStage(al, Inbound)),
 		outbound: NewPipeline(NewArbitrateStage(), NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
 	}, nil
+}
+
+// policyFromConfig assembles the gate's Policy: the built-in DefaultBlockedTools
+// unioned with cfg.BlockedTools form the block-list; cfg.AllowedTools unioned
+// with the USHER_ALLOW_TOOLS env list form the override. The env override is read
+// here (serve time) so an operator can unblock a destructive tool for a single
+// run without editing config.json.
+func policyFromConfig(cfg *config.Config) Policy {
+	blocked := append(append([]string(nil), DefaultBlockedTools...), cfg.BlockedTools...)
+	allowed := append([]string(nil), cfg.AllowedTools...)
+	if env := os.Getenv(config.EnvAllowTools); env != "" {
+		for _, name := range strings.Split(env, ",") {
+			allowed = append(allowed, strings.TrimSpace(name))
+		}
+	}
+	return Policy{BlockedTools: toSet(blocked), AllowedTools: toSet(allowed)}
 }
 
 // ServeStdio bridges one agent (over in/out) to a backend until either side

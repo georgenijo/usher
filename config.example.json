@@ -7,5 +7,7 @@
       "auth": "inherit",
       "default": true
     }
-  ]
+  ],
+  "blockedTools": ["drag"],
+  "allowedTools": []
 }

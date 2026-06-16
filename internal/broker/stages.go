@@ -12,27 +12,152 @@ import (
 // The pipeline order encodes the broker's job. Requests (client→backend) pass
 // through gate then arbitrate; responses (backend→client) pass through trim.
 // Audit sits at the end of both so it records the message as actually
-// forwarded. The three substantive stages below are deliberate pass-throughs in
-// the skeleton — each is the home for a tracked issue:
+// forwarded. Each substantive stage below is the home for a tracked issue:
 //
-//	GateStage      — policy / draft-before-destructive   (#18)
-//	ArbitrateStage — per-window write-lock, TTL lease     (#16)
-//	TrimStage      — compaction of oversized AX digests   (#15 ★, port of
+//	GateStage      — block destructive actions by policy  (#18, implemented)
+//	ArbitrateStage — per-window write-lock, TTL lease      (#16, implemented)
+//	TrimStage      — compaction of oversized AX digests    (#15 ★, port of
 //	                 GhostHands' Python `compaction`)
 //
-// Implementing one means filling in its Process; the wiring already exists.
+// A stage with no policy/registry wired falls back to pass-through, so the
+// skeleton's verbatim-forward behaviour is preserved until each is configured.
 
-// GateStage will block destructive/irreversible actions pending policy. #18.
-type GateStage struct{}
+// ErrToolBlocked is the JSON-RPC error code GateStage returns when a
+// destructive/irreversible tool-call is refused by policy (#18). It is in the
+// JSON-RPC server-error range (-32000..-32099), reserved for application-defined
+// errors, so it never collides with a protocol code; it sits past ErrWindowBusy
+// (-32010) to leave room for future gate-family codes (e.g. a -32021
+// requires-confirmation variant for the deferred draft-before-destructive flow).
+const ErrToolBlocked = -32020
 
-// NewGateStage returns a pass-through gate stage.
+// DefaultBlockedTools is the destructive/irreversible tool set GateStage refuses
+// out of the box — the irreversible cua-driver action (kill_app) plus the
+// canonical web-DOM mutators that submit, send, or buy. A backend never sees a
+// call to one of these unless it is allow-listed back in (config or env). The
+// names are BARE (never namespaced): in the single-backend pump the client talks
+// to one backend so names carry no prefix, and the fanout's routeToolCall strips
+// the namespace and rewrites params.name to the bare name BEFORE the inbound
+// pipeline runs — so GateStage always matches against the bare tool name.
+var DefaultBlockedTools = []string{
+	"kill_app", // irreversible: terminates an app, losing unsaved state
+	"delete",
+	"remove",
+	"send",
+	"submit",
+	"purchase",
+}
+
+// Policy is the gate's configuration: the set of tool names GateStage refuses
+// and the set it has been explicitly told to allow (an override that wins over
+// the block-list). A zero-value Policy (both maps nil/empty) passes everything,
+// preserving the skeleton's pass-through. It is a named struct rather than a bare
+// map so a future requires-confirmation set fits without changing the
+// constructor signature.
+type Policy struct {
+	// BlockedTools is the set of BARE tool names refused by default. O(1) lookup.
+	BlockedTools map[string]struct{}
+	// AllowedTools is the override set: a tool here is forwarded even if it is
+	// also in BlockedTools. This is the config/env "I know what I'm doing" escape
+	// hatch — it lets an operator unblock a specific destructive tool without
+	// rebuilding the whole block-list.
+	AllowedTools map[string]struct{}
+}
+
+// blocks reports whether tool is refused under this policy: present in
+// BlockedTools and NOT overridden in AllowedTools. The allow-list wins so an
+// override can always let a call through.
+func (p Policy) blocks(tool string) bool {
+	if _, allowed := p.AllowedTools[tool]; allowed {
+		return false
+	}
+	_, blocked := p.BlockedTools[tool]
+	return blocked
+}
+
+// toSet turns a slice of bare tool names into a set, skipping empty entries so a
+// stray "" (a trailing comma in an env list) can never match a real tool.
+func toSet(names []string) map[string]struct{} {
+	if len(names) == 0 {
+		return nil
+	}
+	s := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		s[n] = struct{}{}
+	}
+	return s
+}
+
+// GateStage blocks destructive/irreversible tool-calls pending policy (#18). On
+// the INBOUND path a tools/call whose bare tool name is in the policy's
+// block-list (and not overridden by its allow-list) is refused: the stage writes
+// a JSON-RPC ErrToolBlocked response straight back to the client via ctx.Reply
+// and drops the forward (returns nil), so the backend NEVER sees the call. Every
+// other message — read-only and benign tool-calls, and the whole MCP handshake
+// (initialize, notifications/initialized, tools/list) — passes through untouched.
+// With an empty policy the stage is the skeleton's pass-through.
+//
+// The DEFERRED part of #18 — the unified dashboard / "absorb monitor" and the
+// draft-before-destructive confirmation flow (hold the call, ask, re-emit on
+// approval) — is intentionally NOT implemented here; this is the simpler
+// block-and-refuse path. See README "Gate (#18)".
+type GateStage struct {
+	policy Policy
+}
+
+// NewGateStage returns a pass-through gate stage (empty policy). The skeleton and
+// the broker's outbound side use this; the inbound side uses NewGateStagePolicy.
 func NewGateStage() *GateStage { return &GateStage{} }
+
+// NewGateStagePolicy returns a gate stage that enforces the given policy.
+func NewGateStagePolicy(p Policy) *GateStage { return &GateStage{policy: p} }
 
 // Name identifies the stage.
 func (s *GateStage) Name() string { return "gate" }
 
-// Process currently forwards unchanged.
-func (s *GateStage) Process(_ *Context, m *mcp.Message) (*mcp.Message, error) { return m, nil }
+// Process refuses a blocked tool-call and forwards everything else. It only ever
+// acts on an INBOUND tools/call request; the direction guard at the top means
+// responses, notifications, and the handshake are never gated, so the MCP stream
+// stays intact (the broker's hardest constraint).
+func (s *GateStage) Process(ctx *Context, m *mcp.Message) (*mcp.Message, error) {
+	// Only inbound tool-call requests are candidates. notifications/initialized
+	// (no id, not a request), initialize, tools/list (other methods), and every
+	// outbound response fall straight through here.
+	if ctx.Dir != Inbound || !m.IsRequest() || m.Method != "tools/call" {
+		return m, nil
+	}
+	if len(s.policy.BlockedTools) == 0 {
+		return m, nil // no policy: pass-through (skeleton behavior preserved)
+	}
+	var p struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		return m, nil // unparseable params: let the backend reject it, don't guess
+	}
+	if !s.policy.blocks(p.Name) {
+		return m, nil
+	}
+
+	// Blocked. The inbound pump recorded an inflight entry for this id BEFORE the
+	// pipeline ran; no response will ever arrive to consume it (we drop the
+	// forward), so clear it here to keep the per-connection map from leaking. The
+	// fanout path does the same explicitly after a stage drops the message;
+	// owning the cleanup in the stage that drops covers both paths uniformly.
+	if ctx.Inflight != nil {
+		ctx.Inflight.Consume(m.IDString())
+	}
+	resp := mcp.ErrorResponse(m.ID, ErrToolBlocked,
+		fmt.Sprintf("tool %q is blocked by policy", p.Name))
+	if ctx.Reply != nil {
+		if err := ctx.Reply(resp); err != nil {
+			return nil, fmt.Errorf("gate: reply blocked: %w", err)
+		}
+	}
+	return nil, nil
+}
 
 // ErrWindowBusy is the JSON-RPC error code ArbitrateStage returns when a
 // mutating tool-call cannot acquire its window's write-lock within the bounded

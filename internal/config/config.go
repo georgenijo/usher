@@ -49,7 +49,24 @@ type Config struct {
 	// before the broker refuses the call with a JSON-RPC error (#16). Zero
 	// (unset) means use the broker's built-in default.
 	LockWaitSeconds int `json:"lockWaitSeconds,omitempty"`
+
+	// BlockedTools ADDS to the broker's built-in destructive-tool set: extra
+	// BARE tool names the gate refuses (#18). Names are bare (e.g. "kill_app",
+	// "drag"), never namespaced. Omitted/empty leaves only the built-in defaults.
+	BlockedTools []string `json:"blockedTools,omitempty"`
+
+	// AllowedTools OVERRIDES the gate: a bare tool name here is forwarded even if
+	// it is in the built-in or configured block-list (#18). This is the config
+	// escape hatch for an operator who has accepted the risk of a destructive
+	// tool; the env override USHER_ALLOW_TOOLS adds to this set at serve time.
+	AllowedTools []string `json:"allowedTools,omitempty"`
 }
+
+// EnvAllowTools is the environment variable that allow-lists destructive tools
+// past the gate at serve time without editing config.json (#18). Its value is a
+// comma-separated list of BARE tool names; each is unioned into the policy's
+// allow-list, so a matching block is overridden for that run only.
+const EnvAllowTools = "USHER_ALLOW_TOOLS"
 
 // LockTTL is the configured write-lock lease as a Duration, or zero when unset
 // (the broker then applies its built-in default). A non-positive value is unset.

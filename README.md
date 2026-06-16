@@ -21,11 +21,13 @@ bus alongside it.
 
 ## Status
 
-**Skeleton (#14).** Today `usher serve` is a working stdio proxy: it spawns a
-backend, forwards JSON-RPC verbatim in both directions, stamps an identity at
-connect, and audits every message. The pipeline's substantive stages — `trim`
-(#15 ★), `arbitrate` (#16), `gate` (#18) — are wired in execution order but
-pass-through; implementing one means filling in its `Process`.
+**Skeleton (#14) + live pipeline.** Today `usher serve` is a working stdio proxy:
+it spawns a backend, forwards JSON-RPC verbatim in both directions, stamps an
+identity at connect, and audits every message. The substantive stages —
+`trim` (#15 ★), `arbitrate` (#16), and `gate` (#18) — are implemented; each
+falls back to pass-through until configured, so the verbatim-forward default
+holds. The handshake (`initialize`, `notifications/initialized`, `tools/list`)
+always crosses the pipeline untouched.
 
 ## Try it
 
@@ -52,11 +54,49 @@ directly. Audit lines go to stderr.
 - **Go, stdlib-only** (no deps in the skeleton).
 - **No containers** for the broker — it fronts host-bound hands (macOS
   Accessibility / Screen). Containers only ever sandbox untrusted backends.
-- **Arbitration** (planned, #16): per-window write-lock, ungated reads, TTL
-  lease + reclaim-on-death. No RW-lock, no global lock, no preemption.
+- **Arbitration** (#16): per-window write-lock, ungated reads, TTL lease +
+  reclaim-on-death. No RW-lock, no global lock, no preemption.
+- **Gate** (#18): block destructive/irreversible tool-calls by policy (below).
 - **Backend registration** (planned, #32): one path — transport
   (`stdio`/`http`) × auth-strategy (`none`/`env`/`inherit`/`oauth`), Keychain
   secrets, handshake-validated, namespaced.
+
+### Gate — block destructive actions (#18)
+
+The inbound `gate` stage refuses destructive/irreversible tool-calls before the
+broker forwards them. A blocked `tools/call` is never sent to the backend; the
+client gets a JSON-RPC error (code `-32020`) carrying the original request id, so
+the agent gets a clear answer instead of a silent drop. Read-only and benign
+calls, and the whole MCP handshake, pass through untouched.
+
+A built-in destructive set is blocked out of the box — `kill_app` (irreversible)
+plus the canonical web-DOM mutators `delete`, `remove`, `send`, `submit`,
+`purchase`. Tune it from config or the environment (names are **bare** tool
+names, never namespaced):
+
+```jsonc
+// ~/.usher/config.json
+{
+  "blockedTools": ["drag"],     // ADDED to the built-in set
+  "allowedTools": ["kill_app"]  // OVERRIDE: forwarded even though it is blocked
+}
+```
+
+```sh
+# unblock destructive tools for a single run, without editing config
+USHER_ALLOW_TOOLS=kill_app,submit usher serve --backend cua
+```
+
+The allow-list always wins over the block-list, so an operator can let a specific
+destructive tool through after accepting the risk.
+
+**Deferred (still part of #18):** the *unified dashboard / "absorb monitor"* — a
+live view that surfaces gated calls for human approval — is **not** implemented.
+Nor is the *draft-before-destructive* confirmation flow (hold the call, ask, then
+re-emit on approval); that needs a held-message store and a `-32021`
+requires-confirmation code, and the `Policy` struct is shaped to grow a
+`RequireConfirmation` set for it later. Today's gate is the simpler
+block-and-refuse path only.
 
 ## Layout
 
