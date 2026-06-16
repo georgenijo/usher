@@ -6,19 +6,29 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/georgenijo/usher/internal/keychain"
 )
 
 // Backend is one registered MCP server behind the broker.
 type Backend struct {
 	Name      string   `json:"name"`
-	Transport string   `json:"transport"`         // "stdio" (http: future)
+	Transport string   `json:"transport"`         // stdio|http (http: validated-but-stubbed, #32)
 	Command   []string `json:"command,omitempty"` // argv for stdio transport
 	Auth      string   `json:"auth"`              // none|env|inherit|oauth (#32)
-	Default   bool     `json:"default,omitempty"`
+
+	// EnvKeys are the names of the environment variables this backend's secrets
+	// occupy (auth=env only). The VALUES live exclusively in the macOS Keychain
+	// (service "usher.<name>", account = the var name) and are NEVER written to
+	// config.json — only the names appear on disk.
+	EnvKeys []string `json:"envKeys,omitempty"`
+
+	Default bool `json:"default,omitempty"`
 }
 
 // Config is the whole usher state file.
@@ -166,4 +176,45 @@ func (c *Config) Add(b Backend, makeDefault bool) {
 		}
 	}
 	c.Backends = append(c.Backends, b)
+}
+
+// keychainGet is the indirection used by EnvForBackend to read secrets. It is a
+// variable so tests can substitute an in-memory store without touching the real
+// Keychain; production always uses keychain.Get.
+var keychainGet = keychain.Get
+
+// EnvForBackend resolves the KEY=VALUE environment additions a backend's child
+// process needs, according to its auth strategy. It is called at SERVE time
+// (just before spawning the backend), never at add time.
+//
+//	none, inherit, "" → nil: the child inherits the parent environment unchanged
+//	                         (exec.Cmd.Env=nil already does this). The distinction
+//	                         is declarative: "inherit" means the backend relies on
+//	                         the parent's env (HOME/PATH/…); "none" means it is
+//	                         self-contained. Both inject nothing here.
+//	env               → reads each EnvKeys name from the Keychain and returns
+//	                    KEY=<secret> pairs; a missing key is a clear error.
+//	oauth             → reserved; returns an error (not yet supported).
+func EnvForBackend(be *Backend) ([]string, error) {
+	switch be.Auth {
+	case "", "none", "inherit":
+		return nil, nil
+	case "env":
+		out := make([]string, 0, len(be.EnvKeys))
+		for _, k := range be.EnvKeys {
+			v, err := keychainGet(be.Name, k)
+			if errors.Is(err, keychain.ErrNotFound) {
+				return nil, fmt.Errorf("backend %q: secret %q not in Keychain (run: usher backend add %s --auth env --env %s -- ...)", be.Name, k, be.Name, k)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("backend %q: keychain get %q: %w", be.Name, k, err)
+			}
+			out = append(out, k+"="+v)
+		}
+		return out, nil
+	case "oauth":
+		return nil, fmt.Errorf("backend %q: auth=oauth not yet supported", be.Name)
+	default:
+		return nil, fmt.Errorf("backend %q: unknown auth strategy %q (want none|env|inherit|oauth)", be.Name, be.Auth)
+	}
 }

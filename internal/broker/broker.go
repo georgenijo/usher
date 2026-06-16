@@ -63,7 +63,13 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 	id := identity.New()
 	b.audit.Connect(id, be.Name)
 
-	sb := backend.NewStdio(be.Name, be.Command)
+	// Resolve the auth strategy's env additions (Keychain-backed secrets for
+	// auth=env; nil for inherit/none) before spawning the child.
+	envExtra, err := config.EnvForBackend(be)
+	if err != nil {
+		return err
+	}
+	sb := backend.NewStdio(be.Name, be.Command, envExtra)
 	if err := sb.Start(ctx); err != nil {
 		return fmt.Errorf("start backend %q: %w", be.Name, err)
 	}

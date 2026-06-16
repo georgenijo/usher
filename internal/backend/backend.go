@@ -23,16 +23,20 @@ type Backend interface {
 
 // Stdio runs an MCP server as a child process and bridges its stdio.
 type Stdio struct {
-	name  string
-	argv  []string
-	cmd   *exec.Cmd
-	stdin io.WriteCloser
-	conn  *mcp.Conn
+	name     string
+	argv     []string
+	envExtra []string // KEY=VALUE pairs added on top of the inherited env (#32)
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	conn     *mcp.Conn
 }
 
-// NewStdio prepares (does not start) a stdio backend from an argv.
-func NewStdio(name string, argv []string) *Stdio {
-	return &Stdio{name: name, argv: argv}
+// NewStdio prepares (does not start) a stdio backend from an argv. envExtra holds
+// KEY=VALUE pairs appended to the child's inherited environment, used by the
+// auth=env strategy to inject Keychain-resolved secrets (#32). Pass nil for the
+// auth=inherit/none default, which leaves the child's env fully inherited.
+func NewStdio(name string, argv []string, envExtra []string) *Stdio {
+	return &Stdio{name: name, argv: argv, envExtra: envExtra}
 }
 
 // Start launches the child process and wires up the JSON-RPC connection. The
@@ -43,6 +47,13 @@ func (s *Stdio) Start(ctx context.Context) error {
 	}
 	s.cmd = exec.CommandContext(ctx, s.argv[0], s.argv[1:]...)
 	s.cmd.Stderr = os.Stderr
+
+	// Inject auth=env secrets on top of the inherited environment. A nil envExtra
+	// (the inherit/none default) leaves cmd.Env nil, which inherits the parent's
+	// environment wholesale — exactly the previous behaviour.
+	if len(s.envExtra) > 0 {
+		s.cmd.Env = append(os.Environ(), s.envExtra...)
+	}
 
 	stdout, err := s.cmd.StdoutPipe()
 	if err != nil {

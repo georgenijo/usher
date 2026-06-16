@@ -6,17 +6,24 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
+	"github.com/georgenijo/usher/internal/backend"
 	"github.com/georgenijo/usher/internal/broker"
 	"github.com/georgenijo/usher/internal/config"
+	"github.com/georgenijo/usher/internal/keychain"
+	"github.com/georgenijo/usher/internal/mcp"
 )
 
 const version = "0.0.1-dev"
@@ -56,7 +63,14 @@ usage:
   usher serve --backends cua,fs     aggregate the named backends
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
+  usher backend probe NAME          re-run the initialize handshake against a backend
   usher version
+
+backend add flags:
+  --transport stdio|http   transport (http is validated-but-stubbed)
+  --auth none|env|inherit|oauth  auth strategy (default inherit)
+  --env KEY                env var whose secret is read into the Keychain (repeatable, auth=env)
+  --default                make this the default backend
 
 state dir: `+config.StateDir()+`
 `)
@@ -115,15 +129,17 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add> ...")
+		return fmt.Errorf("usage: usher backend <list|add|probe> ...")
 	}
 	switch args[0] {
 	case "list":
 		return backendList()
 	case "add":
 		return backendAdd(args[1:])
+	case "probe":
+		return backendProbe(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
 	}
 }
 
@@ -144,7 +160,26 @@ func backendList() error {
 	return w.Flush()
 }
 
-// backendAdd parses `NAME [--auth A] [--transport T] [--default] -- CMD...`.
+// envFlags is a repeatable --env KEY collector. Each KEY names an environment
+// variable whose secret value is stored in the Keychain (auth=env).
+type envFlags []string
+
+func (e *envFlags) String() string { return strings.Join(*e, ",") }
+func (e *envFlags) Set(v string) error {
+	if v == "" {
+		return fmt.Errorf("--env key must be non-empty")
+	}
+	*e = append(*e, v)
+	return nil
+}
+
+// backendAdd parses
+//
+//	NAME [--transport T] [--auth A] [--env KEY]... [--default] -- CMD...
+//
+// and registers the backend per the full #32 contract: transport x auth, with
+// auth=env secrets stored in the macOS Keychain (only the var NAMES land in
+// config.json), then a handshake probe to prove the backend speaks MCP.
 func backendAdd(args []string) error {
 	sep := -1
 	for i, a := range args {
@@ -154,7 +189,7 @@ func backendAdd(args []string) error {
 		}
 	}
 	if sep == -1 {
-		return fmt.Errorf("usage: usher backend add NAME [--auth A] [--default] -- COMMAND...")
+		return fmt.Errorf("usage: usher backend add NAME [--transport T] [--auth A] [--env KEY]... [--default] -- COMMAND...")
 	}
 	head, cmd := args[:sep], args[sep+1:]
 	if len(head) == 0 {
@@ -162,18 +197,62 @@ func backendAdd(args []string) error {
 	}
 	name := head[0]
 
+	var envKeys envFlags
 	fs := flag.NewFlagSet("backend add", flag.ContinueOnError)
 	auth := fs.String("auth", "inherit", "auth strategy: none|env|inherit|oauth")
 	transport := fs.String("transport", "stdio", "transport: stdio|http")
 	makeDefault := fs.Bool("default", false, "make this the default backend")
+	fs.Var(&envKeys, "env", "env var whose secret is stored in the Keychain (repeatable, auth=env)")
 	if err := fs.Parse(head[1:]); err != nil {
 		return err
 	}
 	if len(cmd) == 0 {
 		return fmt.Errorf("command required after --")
 	}
-	if *transport != "stdio" {
-		return fmt.Errorf("transport %q not supported yet (stdio only)", *transport)
+
+	// Transport: stdio is fully supported; http is recognized but not yet
+	// implemented (validated-but-stubbed — no silent acceptance).
+	switch *transport {
+	case "stdio":
+		// supported
+	case "http":
+		return fmt.Errorf("transport %q recognized but not yet implemented (stdio only); http registration is stubbed pending the http transport", *transport)
+	default:
+		return fmt.Errorf("unknown transport %q (want stdio|http)", *transport)
+	}
+
+	// Auth: validate the strategy and reconcile it with --env.
+	switch *auth {
+	case "none", "inherit":
+		if len(envKeys) > 0 {
+			return fmt.Errorf("--env is only valid with --auth env (got --auth %s)", *auth)
+		}
+	case "env":
+		if len(envKeys) == 0 {
+			return fmt.Errorf("--auth env requires at least one --env KEY")
+		}
+	case "oauth":
+		return fmt.Errorf("auth %q not yet supported (env|inherit|none only)", *auth)
+	default:
+		return fmt.Errorf("unknown auth %q (want none|env|inherit|oauth)", *auth)
+	}
+
+	// For auth=env, prompt for and store each secret in the Keychain BEFORE
+	// writing config, so a failed/aborted prompt leaves no half-registered
+	// backend. The secret value never touches config.json — only the key name.
+	if *auth == "env" {
+		for _, k := range envKeys {
+			secret, err := readSecret(fmt.Sprintf("Enter value for %s (input hidden): ", k))
+			if err != nil {
+				return fmt.Errorf("read secret for %s: %w", k, err)
+			}
+			if secret == "" {
+				return fmt.Errorf("secret for %s was empty; aborting", k)
+			}
+			if err := keychain.Set(name, k, secret); err != nil {
+				return fmt.Errorf("store secret for %s in Keychain: %w", k, err)
+			}
+		}
 	}
 
 	path := config.DefaultPath()
@@ -181,15 +260,181 @@ func backendAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg.Add(config.Backend{
+	be := config.Backend{
 		Name:      name,
 		Transport: *transport,
 		Command:   cmd,
 		Auth:      *auth,
-	}, *makeDefault)
+		EnvKeys:   []string(envKeys),
+	}
+	cfg.Add(be, *makeDefault)
 	if err := cfg.Save(path); err != nil {
 		return err
 	}
-	fmt.Printf("registered backend %q -> %v (auth=%s)\n", name, cmd, *auth)
+
+	// Handshake-validate-on-add: spawn the backend and complete an MCP
+	// initialize, refusing to claim success if it fails. A probe failure is
+	// advisory, not fatal — the backend may be installed-but-not-yet-runnable
+	// (e.g. a key still to be added, an OAuth flow pending) and the user should
+	// still be able to register it. The config is already saved.
+	envExtra, err := config.EnvForBackend(cfg.ResolveBackend(name))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "usher: warning: cannot resolve auth env: %v\n", err)
+		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", name, name)
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := probeBackend(probeCtx, cfg.ResolveBackend(name), envExtra); err != nil {
+		fmt.Fprintf(os.Stderr, "usher: warning: handshake probe failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "usher: backend %q registered but may not work; verify with: usher backend probe %s\n", name, name)
+		return nil
+	}
+	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
 	return nil
+}
+
+// backendProbe re-runs the initialize handshake against an already-registered
+// backend so the user can verify it after fixing a key or finishing an install.
+func backendProbe(args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return fmt.Errorf("usage: usher backend probe NAME")
+	}
+	name := args[0]
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	be := cfg.ResolveBackend(name)
+	if be == nil {
+		return fmt.Errorf("no backend named %q", name)
+	}
+	if be.Transport != "stdio" {
+		return fmt.Errorf("backend %q: transport %q cannot be probed yet (stdio only)", be.Name, be.Transport)
+	}
+	envExtra, err := config.EnvForBackend(be)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := probeBackend(ctx, be, envExtra); err != nil {
+		return fmt.Errorf("backend %q handshake failed: %w", name, err)
+	}
+	fmt.Printf("backend %q handshake: ok\n", name)
+	return nil
+}
+
+// probeBackend spawns the backend, completes the MCP initialize handshake, and
+// tears it down. It is the canonical validation gate for backend add/probe: on
+// success the caller can trust the command runs and speaks MCP. The context's
+// deadline (and exec.CommandContext under it) kills a backend that hangs or
+// never answers, so a long-lived daemon cannot wedge the probe.
+func probeBackend(ctx context.Context, be *config.Backend, envExtra []string) error {
+	sb := backend.NewStdio(be.Name, be.Command, envExtra)
+	if err := sb.Start(ctx); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	defer sb.Close()
+
+	conn := sb.Conn()
+
+	params := json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"usher","version":"` + version + `"}}`)
+	req := &mcp.Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params:  params,
+	}
+	if err := conn.Write(req); err != nil {
+		return fmt.Errorf("write initialize: %w", err)
+	}
+
+	// Read responses on a goroutine so a backend that never replies is bounded by
+	// the context deadline rather than blocking Read forever.
+	type readResult struct {
+		m   *mcp.Message
+		err error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		m, err := conn.Read()
+		ch <- readResult{m, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("initialize: %w", ctx.Err())
+	case r := <-ch:
+		if r.err != nil {
+			return fmt.Errorf("read initialize response: %w", r.err)
+		}
+		if len(r.m.Error) > 0 {
+			return fmt.Errorf("initialize error: %s", r.m.Error)
+		}
+		if len(r.m.Result) == 0 {
+			return fmt.Errorf("initialize returned no result (not an MCP server?)")
+		}
+	}
+
+	// The backend speaks MCP. Send notifications/initialized so it can finish its
+	// handshake cleanly, then close. tools/list is exercised at serve time.
+	_ = conn.Write(&mcp.Message{JSONRPC: "2.0", Method: "notifications/initialized"})
+	return nil
+}
+
+// readSecret reads a single secret line from the terminal with echo disabled, so
+// the value is not shown and does not land in shell history. Echo is toggled via
+// `stty` (POSIX, stdlib-only — no golang.org/x/term dependency). When stdin is
+// not a TTY (e.g. piped input), echo control is skipped and the line is read
+// directly, which lets `printf '%s\n' "$SECRET" | usher backend add ...` work in
+// scripts without leaking to a terminal.
+func readSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+
+	restore := disableEcho()
+	defer restore()
+
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	fmt.Fprintln(os.Stderr) // newline the suppressed Enter didn't echo
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// disableEcho turns off terminal echo for the duration of a secret read and
+// returns a restore func. It is a no-op (and the restore a no-op) when stdin is
+// not an interactive terminal, so piped/non-TTY input still works.
+func disableEcho() func() {
+	if !isTerminal(os.Stdin) {
+		return func() {}
+	}
+	if err := sttyEcho(false); err != nil {
+		return func() {} // best effort: if stty fails the read still works (echoed)
+	}
+	return func() { _ = sttyEcho(true) }
+}
+
+// sttyEcho toggles terminal echo via the stty(1) command, wired to the current
+// /dev/tty so it affects the controlling terminal even when stdin is redirected.
+func sttyEcho(on bool) error {
+	arg := "-echo"
+	if on {
+		arg = "echo"
+	}
+	cmd := exec.Command("/bin/stty", arg)
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+// isTerminal reports whether f is an interactive terminal. It uses the
+// stat-mode character-device heuristic (stdlib-only): a TTY is a character
+// device, whereas a pipe or regular file is not.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

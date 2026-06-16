@@ -88,7 +88,14 @@ func (b *Broker) ServeMulti(ctx context.Context, backendNames []string, in io.Re
 	// dead backend would advertise tools that can never be routed.
 	var started []*backend.Stdio
 	for _, be := range bes {
-		sb := backend.NewStdio(be.Name, be.Command)
+		envExtra, err := config.EnvForBackend(be)
+		if err != nil {
+			for _, s := range started {
+				_ = s.Close()
+			}
+			return err
+		}
+		sb := backend.NewStdio(be.Name, be.Command, envExtra)
 		if err := sb.Start(ctx); err != nil {
 			for _, s := range started {
 				_ = s.Close()
