@@ -6,12 +6,14 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/georgenijo/usher/internal/audit"
 	"github.com/georgenijo/usher/internal/backend"
@@ -20,15 +22,21 @@ import (
 	"github.com/georgenijo/usher/internal/mcp"
 )
 
-// Broker holds the shared config, the per-window write-lock registry, and the
-// two per-direction pipelines.
+// Broker holds the shared config, the per-window write-lock registry, the two
+// per-direction pipelines, and the event bus.
 type Broker struct {
 	cfg      *config.Config
 	audit    *audit.Logger
 	locks    *lockRegistry // shared per-window write-locks (#16)
 	inbound  *Pipeline     // client → backend
 	outbound *Pipeline     // backend → client
+	bus      *Hub          // structured event bus fanned to subscribers (SSE UI, audit)
 }
+
+// Bus exposes the broker's event Hub so the daemon path can subscribe the
+// connection-level audit log and the live UI's SSE stream to it. Never nil for a
+// broker built by New.
+func (b *Broker) Bus() *Hub { return b.bus }
 
 // New builds a broker from config, logging audit to stderr.
 func New(cfg *config.Config) (*Broker, error) {
@@ -45,12 +53,36 @@ func New(cfg *config.Config) (*Broker, error) {
 	// Build the gate policy from the built-in destructive-tool set plus any
 	// config additions, with config + env allow-lists as the override (#18).
 	policy := policyFromConfig(cfg)
+
+	// The event bus fans structured events (conn/request/response/gate/lock,
+	// plus backend-state from the supervisor) to subscribers. Emitting is
+	// non-blocking, so wiring it into the pipeline stages and pumps adds no
+	// latency to forwarding.
+	bus := NewHub()
+
+	// Wire the gate/arbitrate stages' callbacks to the bus. The stages take a
+	// callback, not the Hub, so they stay independent of the event package; a nil
+	// callback (the outbound-side stages, the bare test broker) emits nothing.
+	gate := NewGateStagePolicy(policy)
+	gate.OnBlock = func(tool, connID string) {
+		bus.Emit(GateBlockEvent{TS: time.Now(), Tool: tool, ConnID: connID})
+	}
+	inArb := NewArbitrateStage()
+	inArb.OnLock = func(key, connID string, acquired bool) {
+		bus.Emit(LockEvent{TS: time.Now(), Key: key, ConnID: connID, Acquired: acquired})
+	}
+	outArb := NewArbitrateStage()
+	outArb.OnLock = func(key, connID string, acquired bool) {
+		bus.Emit(LockEvent{TS: time.Now(), Key: key, ConnID: connID, Acquired: acquired})
+	}
+
 	return &Broker{
 		cfg:      cfg,
 		audit:    al,
 		locks:    locks,
-		inbound:  NewPipeline(NewGateStagePolicy(policy), NewArbitrateStage(), NewAuditStage(al, Inbound)),
-		outbound: NewPipeline(NewArbitrateStage(), NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
+		bus:      bus,
+		inbound:  NewPipeline(gate, inArb, NewAuditStage(al, Inbound)),
+		outbound: NewPipeline(outArb, NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
 	}, nil
 }
 
@@ -128,6 +160,7 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 
 	id := identity.NewForConn(conn)
 	b.audit.Connect(id, be.Name)
+	b.bus.Emit(ConnOpenEvent{TS: time.Now(), ConnID: id.ID, PID: id.PID, Backend: be.Name})
 
 	// Resolve the auth strategy's env additions (Keychain-backed secrets for
 	// auth=env; nil for inherit/none) before spawning the child.
@@ -170,6 +203,7 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 	select {
 	case <-ctx.Done():
 		b.audit.Disconnect(id, "signal")
+		b.bus.Emit(ConnCloseEvent{TS: time.Now(), ConnID: id.ID, Reason: "signal"})
 		return nil
 	case <-inboundDone:
 		// Client hung up: half-close the backend so it flushes and exits, then
@@ -177,6 +211,7 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 		_ = sb.CloseStdin()
 		<-outboundDone
 		b.audit.Disconnect(id, "client-eof")
+		b.bus.Emit(ConnCloseEvent{TS: time.Now(), ConnID: id.ID, Reason: "client-eof"})
 		return nil
 	case err := <-outboundDone:
 		// Backend ended first: nothing left to forward.
@@ -185,6 +220,7 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 			reason = err.Error()
 		}
 		b.audit.Disconnect(id, reason)
+		b.bus.Emit(ConnCloseEvent{TS: time.Now(), ConnID: id.ID, Reason: reason})
 		return nil
 	}
 }
@@ -218,16 +254,51 @@ func (b *Broker) pump(id identity.Identity, beName string, dir Direction, inflig
 				ToolName: toolNameIf(m),
 			})
 		}
+		// Capture the on-the-wire size before the pipeline so a trimmed outbound
+		// response can report how much it shed (TrimmedFromBytes). A request keeps
+		// its bytes through the pipeline, so this equals len(out.Raw) there.
+		preBytes := len(m.Raw)
+		wasRequest := m.IsRequest()
+		wasResponse := m.IsResponse()
 		out, err := pipe.Run(pctx, m)
 		if err != nil {
 			b.audit.Errorf(id.ID, "%s pipeline: %v", dir, err)
 			continue
 		}
 		if out == nil {
-			continue // dropped by a stage
+			continue // dropped by a stage (e.g. gated tool-call); no forward, no event
 		}
 		if err := dst.Write(out); err != nil {
 			return err
 		}
+		// Emit the lifecycle event AFTER a successful forward, so the bus reflects
+		// only what actually crossed to the other side — a dropped request (gated)
+		// emits its own GateBlock event from the stage, never a Request here.
+		switch {
+		case dir == Inbound && wasRequest:
+			b.bus.Emit(RequestEvent{
+				TS: time.Now(), ConnID: id.ID, AgentPID: id.PID, Backend: beName,
+				Tool: toolNameIf(out), RPCID: out.IDString(),
+			})
+		case dir == Outbound && wasResponse:
+			b.bus.Emit(ResponseEvent{
+				TS: time.Now(), ConnID: id.ID, Backend: beName, RPCID: out.IDString(),
+				Bytes: outboundBytes(out), TrimmedFromBytes: preBytes,
+			})
+		}
 	}
+}
+
+// outboundBytes returns the on-the-wire size of a forwarded message. A verbatim
+// message still carries its original Raw; a stage that rewrote it (TrimStage)
+// cleared Raw, so we re-marshal to measure the bytes the client will actually
+// receive. Best-effort: a marshal error falls back to the (now stale) Raw length.
+func outboundBytes(m *mcp.Message) int {
+	if m.Raw != nil {
+		return len(m.Raw)
+	}
+	if b, err := json.Marshal(m); err == nil {
+		return len(b)
+	}
+	return len(m.Raw)
 }

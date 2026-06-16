@@ -105,6 +105,13 @@ func toSet(names []string) map[string]struct{} {
 // block-and-refuse path. See README "Gate (#18)".
 type GateStage struct {
 	policy Policy
+
+	// OnBlock, when set, is called just before the stage refuses a tool-call —
+	// with the bare tool name and the connection id (ctx.Identity.ID) — so the
+	// broker can emit a GateBlock event without the stage importing the event Hub.
+	// A nil callback is the default and emits nothing, preserving the stage's
+	// existing behaviour (the bus is injected, not imported, like ctx.Locks).
+	OnBlock func(tool, connID string)
 }
 
 // NewGateStage returns a pass-through gate stage (empty policy). The skeleton and
@@ -149,6 +156,11 @@ func (s *GateStage) Process(ctx *Context, m *mcp.Message) (*mcp.Message, error) 
 	if ctx.Inflight != nil {
 		ctx.Inflight.Consume(m.IDString())
 	}
+	// Signal the block to the event bus (nil callback = no emit). Done before the
+	// reply so a GateBlock event always precedes any follow-on for this id.
+	if s.OnBlock != nil {
+		s.OnBlock(p.Name, ctx.Identity.ID)
+	}
 	resp := mcp.ErrorResponse(m.ID, ErrToolBlocked,
 		fmt.Sprintf("tool %q is blocked by policy", p.Name))
 	if ctx.Reply != nil {
@@ -178,7 +190,14 @@ const ErrWindowBusy = -32010
 // Leases are TTL'd (a never-answered call frees its window) and the broker
 // reclaims an owner's locks when its connection ends, so neither a stuck backend
 // nor a vanished caller can wedge a window forever.
-type ArbitrateStage struct{}
+type ArbitrateStage struct {
+	// OnLock, when set, is called after a write-lock is taken (acquired=true) or
+	// freed (acquired=false), with the window key's string form and the connection
+	// id, so the broker can emit a Lock event. As with GateStage.OnBlock the
+	// callback is injected rather than the Hub imported; a nil callback emits
+	// nothing and leaves the stage's behaviour unchanged.
+	OnLock func(key, connID string, acquired bool)
+}
 
 // NewArbitrateStage returns the arbitration stage. Its behaviour is driven by
 // ctx.Locks (the shared registry) and ctx.Dir; with a nil registry it forwards
@@ -239,6 +258,9 @@ func (s *ArbitrateStage) acquire(ctx *Context, m *mcp.Message) (*mcp.Message, er
 	if ctx.Inflight != nil {
 		ctx.Inflight.SetLock(m.IDString(), dec.key, token)
 	}
+	if s.OnLock != nil {
+		s.OnLock(dec.key.String(), owner, true)
+	}
 	return m, nil
 }
 
@@ -254,7 +276,12 @@ func (s *ArbitrateStage) release(ctx *Context, m *mcp.Message) (*mcp.Message, er
 	if !ok || !entry.Locked {
 		return m, nil // no lock was taken for this request
 	}
-	ctx.Locks.Release(entry.LockKey, entry.LockToken)
+	// Emit the release only when this call actually freed the lease — a stale
+	// token (the lease was already TTL-reclaimed or reclaimed-on-death) is a no-op
+	// and must not emit a phantom release for a lock someone else may now hold.
+	if ctx.Locks.Release(entry.LockKey, entry.LockToken) && s.OnLock != nil {
+		s.OnLock(entry.LockKey.String(), ctx.Identity.ID, false)
+	}
 	return m, nil
 }
 

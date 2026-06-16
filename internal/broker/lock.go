@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"strconv"
 	"sync"
 	"time"
 )
@@ -39,6 +40,16 @@ type windowKey struct {
 // isWildcard reports whether the key locks the whole process rather than a
 // single window.
 func (k windowKey) isWildcard() bool { return k.windowID == wildcardWindow }
+
+// String renders the key for event/audit lines: "pid=<pid> window=<id>", with
+// the wildcard window shown as "*" so a whole-process lock reads "pid=1 window=*".
+func (k windowKey) String() string {
+	win := strconv.FormatInt(k.windowID, 10)
+	if k.isWildcard() {
+		win = "*"
+	}
+	return "pid=" + strconv.FormatInt(k.pid, 10) + " window=" + win
+}
 
 // lease is the live state of one held lock. owner is the connection Identity.ID
 // that holds it; acquiredAt anchors the TTL; token disambiguates successive

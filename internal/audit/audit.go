@@ -31,6 +31,20 @@ func (a *Logger) Disconnect(id identity.Identity, reason string) {
 	a.l.Printf("disconnect id=%s reason=%s", id.ID, reason)
 }
 
+// ConnectID records a new connection from its id/pid/backend directly, rather
+// than from a full Identity. The event-bus audit subscriber uses it: it receives
+// a ConnOpenEvent (which already carries these fields) and cannot reconstruct the
+// original Identity, so it logs the same line from the raw fields.
+func (a *Logger) ConnectID(id string, pid int, backend string) {
+	a.l.Printf("connect id=%s pid=%d backend=%s", id, pid, backend)
+}
+
+// DisconnectID records the end of a connection from its id directly, the
+// event-bus counterpart to Disconnect (which takes a full Identity).
+func (a *Logger) DisconnectID(id, reason string) {
+	a.l.Printf("disconnect id=%s reason=%s", id, reason)
+}
+
 // Message records one message crossing the broker. dir is a human label
 // ("client→backend" / "backend→client"); method and msgID may be empty.
 func (a *Logger) Message(id, dir, method, msgID string, nbytes int) {
