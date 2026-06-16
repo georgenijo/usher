@@ -23,15 +23,24 @@ import (
 )
 
 // Broker holds the shared config, the per-window write-lock registry, the two
-// per-direction pipelines, and the event bus.
+// per-direction pipelines, the event bus, and (on the daemon path) the shared
+// backend pool.
 type Broker struct {
 	cfg      *config.Config
 	audit    *audit.Logger
-	locks    *lockRegistry // shared per-window write-locks (#16)
-	inbound  *Pipeline     // client → backend
-	outbound *Pipeline     // backend → client
-	bus      *Hub          // structured event bus fanned to subscribers (SSE UI, audit)
+	locks    *lockRegistry      // shared per-window write-locks (#16)
+	inbound  *Pipeline          // client → backend
+	outbound *Pipeline          // backend → client
+	bus      *Hub               // structured event bus fanned to subscribers (SSE UI, audit)
+	sv       *BackendSupervisor // shared backend pool, built lazily on the socket/daemon path
 }
+
+// Supervisor exposes the broker's shared backend pool, built on demand by the
+// socket/daemon path. It is nil on the bare stdio path (which spawns its own
+// per-connection child) and until ServeSocket has constructed it; callers must
+// nil-check. The live UI's control plane reads it for the backend listing and
+// drives Start/Stop/Restart through it.
+func (b *Broker) Supervisor() *BackendSupervisor { return b.sv }
 
 // Bus exposes the broker's event Hub so the daemon path can subscribe the
 // connection-level audit log and the live UI's SSE stream to it. Never nil for a
@@ -112,12 +121,34 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 }
 
 // ServeSocket runs the always-on daemon: it accepts connections on ln and
-// proxies each one through its own serveConn (a fresh identity, backend child,
-// inflight map, and pump pair). The process-wide lock registry arbitrates
-// contention ACROSS connections. ServeSocket returns when ctx is cancelled (it
-// closes ln, which unblocks Accept) or Accept fails for a non-shutdown reason.
+// proxies each one through serveConn (a fresh identity, inflight map, and pump
+// pair). The process-wide lock registry arbitrates contention ACROSS
+// connections. ServeSocket returns when ctx is cancelled (it closes ln, which
+// unblocks Accept) or Accept fails for a non-shutdown reason.
+//
+// The daemon owns a shared BackendSupervisor (the pool): it is built here so the
+// control plane can list backends and drive their lifecycle, and the configured
+// backend is brought live through it on startup so the pool's state machine and
+// its BackendState events are the source of truth. Full client-multiplexing of
+// many connections onto the one shared child (the inverse of #17's fan-out) is
+// the mux layer that lands next; until then serveConn keeps the per-connection
+// proxy. The pool is torn down on return so no shared child is orphaned.
 func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Listener) error {
 	defer ln.Close()
+
+	// Build the shared backend pool once per daemon and route the backend's
+	// lifecycle (come-live, state events) through it. EnsureLive lazily starts the
+	// shared child and runs its one-time handshake; a start failure is surfaced as
+	// a warning rather than aborting the daemon, since a later request can retry.
+	if b.sv == nil {
+		b.sv = NewSupervisor(ctx, b.cfg, b.bus)
+	}
+	defer b.sv.StopAll()
+	if be := b.cfg.ResolveBackend(backendName); be != nil {
+		if _, err := b.sv.EnsureLive(be.Name); err != nil {
+			b.audit.Errorf("supervisor", "backend %q failed to come live: %v", be.Name, err)
+		}
+	}
 
 	// Close the listener on ctx cancel so the Accept loop unblocks and returns.
 	go func() {
