@@ -30,6 +30,29 @@ func TestInflightMap_RecordConsume(t *testing.T) {
 	}
 }
 
+func TestInflightMap_BackendNameAndClientID(t *testing.T) {
+	// The fanout (#17) stamps the originating backend and the original client id
+	// so the outbound side can attribute the response and restore the client id.
+	f := NewInflightMap()
+	f.Record("17", InflightEntry{
+		Method:      "tools/call",
+		ToolName:    "click",
+		BackendName: "cua",
+		ClientID:    "42",
+	})
+
+	// Peek leaves the entry in place (the outbound pump reads ClientID before the
+	// pipeline's TrimStage Consumes it by the same backend-side id).
+	peeked, ok := f.Peek("17")
+	if !ok || peeked.BackendName != "cua" || peeked.ClientID != "42" {
+		t.Fatalf("Peek = %+v ok=%v, want backend=cua client=42", peeked, ok)
+	}
+	got, ok := f.Consume("17")
+	if !ok || got.BackendName != "cua" || got.ClientID != "42" || got.ToolName != "click" {
+		t.Errorf("Consume = %+v, want backend=cua client=42 tool=click", got)
+	}
+}
+
 func TestInflightMap_EmptyIDIgnored(t *testing.T) {
 	f := NewInflightMap()
 	f.Record("", InflightEntry{Method: "notifications/initialized"})

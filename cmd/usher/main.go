@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -51,6 +52,8 @@ func usage() {
 
 usage:
   usher serve [--backend NAME]      proxy stdio MCP to a backend (the daemon)
+  usher serve --all                 aggregate ALL backends (namespaced tools)
+  usher serve --backends cua,fs     aggregate the named backends
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher version
@@ -60,9 +63,14 @@ state dir: `+config.StateDir()+`
 }
 
 // cmdServe runs the stdio proxy: stdin/stdout is the agent, routed to a backend.
+// By default it is the legacy 1:1 proxy (--backend NAME). --all (or --backends
+// a,b,c) instead aggregates several backends behind one connection, merging
+// their tools/list with namespaced names and routing tools/call by prefix (#17).
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	backendName := fs.String("backend", "", "backend to route to (default: configured default)")
+	all := fs.Bool("all", false, "aggregate ALL configured backends behind one connection")
+	backends := fs.String("backends", "", "comma-separated backends to aggregate (e.g. cua,fs)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -79,7 +87,29 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Multi-backend aggregation is opt-in and additive; the default path is the
+	// unchanged single-backend ServeStdio.
+	if *all || *backends != "" {
+		names := splitBackends(*backends) // nil when --all alone -> "every configured"
+		return b.ServeMulti(ctx, names, os.Stdin, os.Stdout)
+	}
 	return b.ServeStdio(ctx, *backendName, os.Stdin, os.Stdout)
+}
+
+// splitBackends parses a "cua,fs" list into names, trimming blanks. An empty
+// string yields nil so ServeMulti aggregates every configured backend.
+func splitBackends(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // cmdBackend handles the backend control subcommands.

@@ -11,7 +11,18 @@ import (
 // can act on the matching response — which carries no method of its own.
 type InflightEntry struct {
 	Method   string // JSON-RPC method, e.g. "tools/call", "tools/list"
-	ToolName string // params.name when Method == "tools/call", else ""
+	ToolName string // params.name (bare, namespace stripped) when Method == "tools/call", else ""
+
+	// BackendName names the backend this request was routed to in multi-backend
+	// aggregation (#17). The fanout fills it so an audit line on the response can
+	// attribute the right backend; single-backend ServeStdio leaves it "".
+	BackendName string
+
+	// ClientID is the request's ORIGINAL client-side JSON-RPC id, retained when
+	// the fanout remaps the id to a globally-unique backend-side id so two
+	// backends can never collide (#17). The outbound path restores it before the
+	// response reaches the client. Empty when no remapping occurred (ServeStdio).
+	ClientID string
 
 	// Locked is set when ArbitrateStage took a per-window write-lock for this
 	// request (#16); the outbound ArbitrateStage releases LockKey with LockToken
