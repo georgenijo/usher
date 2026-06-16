@@ -1,0 +1,7 @@
+# build output
+/usher
+/dist/
+
+# go
+*.test
+*.out

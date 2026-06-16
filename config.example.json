@@ -1,0 +1,11 @@
+{
+  "backends": [
+    {
+      "name": "cua",
+      "transport": "stdio",
+      "command": ["/Users/you/.local/bin/cua-driver", "mcp"],
+      "auth": "inherit",
+      "default": true
+    }
+  ]
+}
