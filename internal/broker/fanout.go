@@ -207,12 +207,16 @@ func (b *Broker) resolveBackends(names []string) ([]*config.Backend, error) {
 
 // runHandshake completes the MCP startup exchange against every backend before
 // the duplex pumps begin. It (1) reads the client's initialize, fans it out, and
-// merges the responses into one answer to the client; (2) prefetches tools/list
-// from every backend and builds the namespaced merged list; (3) reads the
-// client's notifications/initialized and fans it out. After this returns nil the
-// routing table (f.mergedTools) is fully built, so no tools/call can race ahead
-// of it. The fanout owns the id allocator and the merged-tools cache it
-// populates, so this lives on fanout.
+// merges the responses into one answer to the client; (2) reads the client's
+// notifications/initialized and fans it out; (3) prefetches tools/list from every
+// backend and builds the namespaced merged list. The MCP lifecycle requires a
+// server to receive notifications/initialized before it answers tool/resource
+// requests, so the prefetch MUST follow the notification fanout — a strict
+// backend would otherwise reject or defer the tools/list. Sequencing here is safe
+// because the full-duplex pumps have not started yet, so no race can occur. After
+// this returns nil the routing table (f.mergedTools) is fully built, so no
+// tools/call can race ahead of it. The fanout owns the id allocator and the
+// merged-tools cache it populates, so this lives on fanout.
 func (f *fanout) runHandshake(b *Broker, id identity.Identity, client *mcp.Conn) error {
 	// 1. initialize ----------------------------------------------------------
 	initReq, err := client.Read()
@@ -246,30 +250,27 @@ func (f *fanout) runHandshake(b *Broker, id identity.Identity, client *mcp.Conn)
 		return err
 	}
 
-	// 2. tools/list prefetch + merge ----------------------------------------
-	if err := f.prefetchTools(); err != nil {
-		return err
-	}
-
-	// 3. notifications/initialized ------------------------------------------
+	// 2. notifications/initialized ------------------------------------------
+	// Forward the client's notifications/initialized to every backend BEFORE we
+	// send them any tool/resource request, per the MCP lifecycle. A client that
+	// skips the notification still has whatever it sent forwarded so nothing is
+	// dropped; either way every backend has seen the post-initialize traffic
+	// before the prefetch below.
 	note, err := client.Read()
 	if err != nil {
 		return err
 	}
-	if note.IsNotification() && note.Method == "notifications/initialized" {
-		for _, name := range f.order {
-			if err := f.conns[name].Write(note); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	// Some clients skip the notification; forward whatever this was to all
-	// backends so nothing is dropped, then proceed.
 	for _, name := range f.order {
 		if err := f.conns[name].Write(note); err != nil {
 			return err
 		}
+	}
+
+	// 3. tools/list prefetch + merge ----------------------------------------
+	// Only now — after the backends have received notifications/initialized — do
+	// we prefetch tools/list and build the namespaced merged routing table.
+	if err := f.prefetchTools(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -496,10 +497,25 @@ func (b *Broker) dispatchInbound(id identity.Identity, f *fanout, inflight *Infl
 			continue
 		}
 
-		// Any other request or notification (ping, logging, etc.): fan out to
-		// every backend verbatim. Requests carry their own client id; we leave it
-		// untouched (these are not tool-call results and TrimStage/Arbitrate do
-		// not act on them). Notifications have no id and need no correlation.
+		// Any other request (ping, resources/list, logging/setLevel, …): a request
+		// carries an id and expects EXACTLY ONE response. Fanning it to every
+		// backend would yield N identical responses (each backend's outbound pump
+		// forwards one) for a single client id — a stream corruption. So a non
+		// tools/call request goes to only ONE backend: the first in config order.
+		// Its id is left untouched (not a tool-call result; TrimStage/Arbitrate do
+		// not act on it), so the single response round-trips with no remap needed.
+		if m.IsRequest() {
+			first := f.order[0]
+			if err := f.conns[first].Write(m); err != nil {
+				return err
+			}
+			b.audit.Message(id.ID, Inbound.String(), m.Method, m.IDString(), len(m.Raw))
+			continue
+		}
+
+		// A notification (ping, cancellation, logging) has no id and no response,
+		// so it is safe — and often required — to fan out to every backend. No
+		// correlation is needed because nothing comes back.
 		for _, name := range f.order {
 			if err := f.conns[name].Write(m); err != nil {
 				return err
@@ -576,7 +592,7 @@ func (b *Broker) routeToolCall(id identity.Identity, f *fanout, inflight *Inflig
 		}
 		return reply(rm)
 	}
-	pctx := &Context{Identity: id, Backend: beName, Dir: Inbound, Inflight: inflight, Locks: b.locks, Reply: clientReply}
+	pctx := &Context{Identity: id, Backend: beName, Dir: Inbound, Inflight: inflight, Locks: b.locks, Reply: clientReply, ClientID: clientID}
 	out, err := b.inbound.Run(pctx, m)
 	if err != nil {
 		b.audit.Errorf(id.ID, "%s pipeline: %v", Inbound, err)
@@ -625,6 +641,12 @@ func (b *Broker) pumpFanoutOutbound(id identity.Identity, beName string, infligh
 				clientID = entry.ClientID
 			}
 		}
+
+		// Hand the client-facing id to the pipeline so AuditStage logs it while the
+		// inflight-keyed stages (Trim/Arbitrate) still correlate on the backend-side
+		// id carried by m. Reset every iteration (pctx is reused across the loop) so
+		// a non-remapped message does not inherit a prior message's client id.
+		pctx.ClientID = clientID
 
 		out, err := b.outbound.Run(pctx, m)
 		if err != nil {

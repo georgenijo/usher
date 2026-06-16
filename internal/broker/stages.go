@@ -250,8 +250,16 @@ func NewAuditStage(l *audit.Logger, dir Direction) *AuditStage {
 // Name identifies the stage.
 func (s *AuditStage) Name() string { return "audit" }
 
-// Process records the message, then forwards it unchanged.
+// Process records the message, then forwards it unchanged. When the fanout has
+// stashed the client-facing id (ctx.ClientID, #17), the log shows that rather
+// than the internal backend-side id still on the message — the message keeps its
+// backend-side id so the inflight-keyed stages can correlate, but the audit line
+// reports the id the client actually saw.
 func (s *AuditStage) Process(ctx *Context, m *mcp.Message) (*mcp.Message, error) {
-	s.log.Message(ctx.Identity.ID, s.dir.String(), m.Method, m.IDString(), len(m.Raw))
+	msgID := m.IDString()
+	if ctx.ClientID != "" {
+		msgID = ctx.ClientID
+	}
+	s.log.Message(ctx.Identity.ID, s.dir.String(), m.Method, msgID, len(m.Raw))
 	return m, nil
 }

@@ -46,6 +46,16 @@ type Context struct {
 	// error response here and returns (nil, nil) to drop the forward, so the
 	// agent gets an answer instead of hanging. Nil on the outbound path.
 	Reply func(*mcp.Message) error
+
+	// ClientID, when non-empty, is the response's ORIGINAL client-side JSON-RPC
+	// id in multi-backend aggregation (#17). The fanout's outbound pump keeps the
+	// backend-side id on the message through the pipeline so the inflight-keyed
+	// stages (TrimStage.Consume, ArbitrateStage.release) still correlate, but the
+	// id the client actually sees is the client id, restored just before the
+	// wire. AuditStage prefers this so its log line shows the client-facing id
+	// instead of the internal backend-side id. Empty on the single-backend path
+	// and for responses the fanout did not remap.
+	ClientID string
 }
 
 // Stage is one step in the middleware pipeline. Process may inspect or transform

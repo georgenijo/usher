@@ -87,6 +87,13 @@ func fakeBackendMain() {
 				"content": []any{map[string]any{"type": "text", "text": text}},
 			})
 			_ = conn.Write(&mcp.Message{JSONRPC: "2.0", ID: m.ID, Result: result})
+		case len(m.ID) > 0:
+			// Any other REQUEST (ping, resources/list, …): answer with a result that
+			// names this backend, so a test fanning a non-tools/call request can
+			// assert exactly ONE response arrives (not one per backend) and tell
+			// which backend produced it.
+			result, _ := json.Marshal(map[string]any{"answeredBy": name})
+			_ = conn.Write(&mcp.Message{JSONRPC: "2.0", ID: m.ID, Result: result})
 		}
 	}
 }
@@ -387,6 +394,46 @@ func TestServeMulti_ConcurrentCallsToDifferentBackends(t *testing.T) {
 	}
 }
 
+// TestServeMulti_NonToolCallRequestNotDuplicated guards the fan-out de-dup fix:
+// a non-tools/call REQUEST (here a ping) carries an id and expects EXACTLY ONE
+// response. With two backends aggregated, fanning the request to both would yield
+// two identical responses for one client id — a stream corruption. The broker
+// must route such a request to a single backend, so the client sees one response.
+// We prove "exactly one" by sending a follow-up tools/call with a distinct id and
+// asserting the very next response is that call's (id 2), not a duplicate ping
+// (id 1): a second ping response would have been queued ahead of it.
+func TestServeMulti_NonToolCallRequestNotDuplicated(t *testing.T) {
+	b := multiTestBroker(t, map[string][]string{
+		"cua": {"click"},
+		"fs":  {"read_file"},
+	})
+	cp, done := runServeMulti(t, b, nil)
+	defer drainDone(t, cp, done)
+
+	cp.handshake(t)
+
+	// A single ping must produce a single response with the client's id.
+	cp.send(t, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	r1 := cp.recv(t)
+	if r1.IDString() != "1" {
+		t.Fatalf("ping response id = %q, want 1", r1.IDString())
+	}
+	if !r1.IsResponse() {
+		t.Fatalf("ping: expected a response, got %+v", r1)
+	}
+
+	// Follow with a tools/call (id 2). If the ping had been duplicated, a second
+	// ping response (id 1) would be sitting in the pipe ahead of this one.
+	cp.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cua__click","arguments":{}}}`)
+	r2 := cp.recv(t)
+	if r2.IDString() != "2" {
+		t.Fatalf("next response id = %q, want 2 (a duplicate ping response would precede it)", r2.IDString())
+	}
+	if text := resultText(t, r2); text != "backend=cua tool=click" {
+		t.Errorf("tools/call routed wrong: %q", text)
+	}
+}
+
 // TestServeMulti_SubsetByName aggregates only the named subset, not all
 // configured backends, and confirms the other backend's tools are absent.
 func TestServeMulti_SubsetByName(t *testing.T) {
@@ -467,6 +514,15 @@ func TestServeMulti_BusyErrorCarriesClientID(t *testing.T) {
 	b := multiTestBroker(t, map[string][]string{
 		"cua": {"click"},
 	})
+	// This test exercises the window-busy refusal path, which only fires if
+	// classifyToolCall treats the bare "click" (the namespace "cua__" is stripped
+	// before ArbitrateStage sees it) as a window-MUTATING tool that locks
+	// windowKey{pid, window_id}. If a future toolclass.go change reclassified
+	// "click" as read-only or windowless, the routed call would never contend for
+	// the pre-held lock, no ErrWindowBusy would be returned, and this test would
+	// stop asserting the id-restore behaviour it claims to cover. Keep "click"
+	// mutating in classifyToolCall for this test to remain meaningful.
+	//
 	// Tight bounded wait so the contended call is refused fast; hold the lock so
 	// the routed click can never acquire it.
 	b.locks = newLockRegistry(time.Minute, 20*time.Millisecond)
