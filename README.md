@@ -47,6 +47,27 @@ go build -o usher ./cmd/usher
 that spawns a stdio server can point at `usher serve` instead of the tool
 directly. Audit lines go to stderr.
 
+## Install
+
+macOS only (launchd, the Keychain, the Accessibility tree behind its backends).
+
+```sh
+# Homebrew (cask)
+brew tap georgenijo/usher && brew install --cask usher
+
+# curl (no Homebrew)
+curl -fsSL https://raw.githubusercontent.com/georgenijo/usher/main/scripts/install.sh | sh
+
+# from source
+go install github.com/georgenijo/usher/cmd/usher@latest
+
+usher install   # register the always-on launchd daemon
+```
+
+Releases are cut with [GoReleaser](.goreleaser.yaml) (a single universal binary
++ per-arch tarballs, checksummed). Sign/notarize/publish are manual steps —
+see [RELEASING.md](./RELEASING.md).
+
 ## Design
 
 - **Single binary**, daemon + control CLI. State dir `~/.usher/` (override with

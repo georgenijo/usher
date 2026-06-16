@@ -26,7 +26,10 @@ import (
 	"github.com/georgenijo/usher/internal/mcp"
 )
 
-const version = "0.0.1-dev"
+// version is the build version. It is a var (not const) so the release build
+// can stamp the real tag via ldflags: -X main.version={{.Version}} (#21). The
+// default below is what a plain `go build` / `go install` reports.
+var version = "0.0.1-dev"
 
 func main() {
 	if len(os.Args) < 2 {

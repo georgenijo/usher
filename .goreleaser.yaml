@@ -1,0 +1,106 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# GoReleaser config for usher (#21). usher is macOS-only (launchd, the macOS
+# Keychain via /usr/bin/security, the Accessibility tree behind its backends),
+# so this builds darwin/arm64 + darwin/amd64 ONLY — no linux/windows. The build
+# is pure-Go and shells out to system binaries rather than linking frameworks,
+# so CGO_ENABLED=0 is correct (verified: `CGO_ENABLED=0 go build ./...` passes).
+#
+# What this config does NOT do (deliberately — see RELEASING.md): code signing,
+# notarization, or any publish that needs a Developer ID cert / Apple account /
+# a push token. Those are MANUAL steps gated outside this file.
+version: 2
+
+project_name: usher
+
+before:
+  hooks:
+    # Keep the module tidy and the tree vetted before a release is cut.
+    - go mod tidy
+    - go vet ./...
+
+builds:
+  - id: usher
+    main: ./cmd/usher
+    binary: usher
+    goos: [darwin]
+    goarch: [arm64, amd64]
+    env:
+      # Pure-Go: no cgo. The Keychain path shells out to /usr/bin/security and
+      # peer-pid uses raw syscalls, so nothing links the Security framework.
+      - CGO_ENABLED=0
+    ldflags:
+      # Strip debug info and stamp the real tag into main.version (a var, not a
+      # const, exactly so this -X works). `usher version` then prints the tag.
+      - -s -w -X main.version={{ .Version }}
+    # Reproducible builds: pin the binary mtime to the commit, not build time.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# Fold the two arches into one universal (fat) binary so Homebrew and the curl
+# installer ship a single artifact that runs on Intel and Apple Silicon. The
+# per-arch builds are kept (replace: false) so a consumer that wants a thin
+# binary can still grab one.
+universal_binaries:
+  - id: usher
+    ids:
+      - usher
+    name_template: "usher"
+    replace: false
+
+archives:
+  - id: usher
+    ids:
+      - usher
+    # Stable, predictable names the curl installer can construct by hand:
+    #   usher_<version>_darwin_<arch>.tar.gz   (arch ∈ arm64, amd64, all)
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  # One line per archive; the curl installer greps its tarball out of this and
+  # verifies it with `shasum -a 256 -c`.
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: georgenijo
+    name: usher
+  draft: false
+  # Mark a tag like v0.2.0-rc1 (contains a hyphen) as a pre-release.
+  prerelease: auto
+  name_template: "v{{ .Version }}"
+
+# Homebrew tap. NOTE: GoReleaser v2 deprecated the old `brews:` (formula) key in
+# favour of `homebrew_casks:` — a cask that installs the binary into the
+# Caskroom and symlinks it onto PATH. Users install via:
+#   brew tap georgenijo/usher && brew install --cask usher
+#
+# The tap repo (github.com/georgenijo/homebrew-usher) must EXIST before a release
+# and HOMEBREW_TAP_GITHUB_TOKEN must be set — both are manual one-time steps
+# documented in RELEASING.md. GoReleaser then writes Casks/usher.rb on each tag.
+homebrew_casks:
+  - name: usher
+    binaries: [usher]
+    repository:
+      owner: georgenijo
+      name: homebrew-usher # separate tap repo; must exist (see RELEASING.md)
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: George Nijo
+      email: george.nijo8@gmail.com
+    homepage: "https://github.com/georgenijo/usher"
+    description: "MCP broker — one front desk every AI agent talks to"
+    # Register the launchd LaunchAgent from the Caskroom binary, not from PATH,
+    # so the plist points at a stable absolute path. Run `usher install` after
+    # install to register the daemon (a Homebrew anti-pattern to do in-formula).
+    caveats: |
+      The binary is NOT yet code-signed or notarized, so first run may be
+      Gatekeeper-flagged. To register the always-on daemon (launchd LaunchAgent):
+        usher install
+      To register the default backend (GhostHands cua-driver):
+        usher backend add cua -- ~/.local/bin/cua-driver mcp

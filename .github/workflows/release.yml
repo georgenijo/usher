@@ -1,0 +1,37 @@
+name: release
+
+# Cuts a GitHub Release + pushes the Homebrew cask when a v* tag is pushed (#21).
+# NOTE: this workflow does NOT sign or notarize — the macos-latest GitHub runner
+# does not hold a Developer ID cert. The sign/notarize flow is MANUAL and runs
+# locally before publishing; see RELEASING.md. This CI path produces UNSIGNED
+# artifacts, which is fine for a local-only tool but will Gatekeeper-flag on
+# first run until the manual signing flow is used instead.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+jobs:
+  release:
+    runs-on: macos-latest # darwin-only binary — must build on macOS
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # GoReleaser needs full history for the changelog
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Fine-grained PAT with contents:write on georgenijo/homebrew-usher.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
