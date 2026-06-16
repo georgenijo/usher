@@ -37,6 +37,24 @@ func (m *Message) IDString() string {
 	return string(m.ID)
 }
 
+// ErrorResponse builds a JSON-RPC 2.0 error response carrying the same id as the
+// request it answers, so a stage that must refuse a call (e.g. ArbitrateStage on
+// a window that stays busy past the bounded wait, #16) can reply to the client
+// in-band instead of letting the agent hang waiting for a result. id is the raw
+// id bytes from the request (Message.ID); code/message follow the JSON-RPC error
+// object shape. Raw is left nil so Conn.Write marshals the struct.
+func ErrorResponse(id json.RawMessage, code int, message string) *Message {
+	errObj, _ := json.Marshal(struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}{Code: code, Message: message})
+	return &Message{
+		JSONRPC: "2.0",
+		ID:      append(json.RawMessage(nil), id...),
+		Error:   errObj,
+	}
+}
+
 // IsRequest reports whether the message is a call expecting a response.
 func (m *Message) IsRequest() bool { return m.Method != "" && len(m.ID) > 0 }
 

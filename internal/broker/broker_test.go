@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/georgenijo/usher/internal/audit"
 	"github.com/georgenijo/usher/internal/config"
@@ -54,7 +55,7 @@ func TestBroker_InboundRecordOutboundTrim(t *testing.T) {
 	}()
 
 	// Run the inbound pump; it records into inflight and forwards to backendDst.
-	go func() { _ = b.pump(id, "test", Inbound, inflight, clientSrc, backendDst, b.inbound) }()
+	go func() { _ = b.pump(id, "test", Inbound, inflight, nil, clientSrc, backendDst, b.inbound) }()
 
 	// Drain what the backend received.
 	gotReqs := readAllMessages(t, backendDst, len(clientReqs))
@@ -84,7 +85,7 @@ func TestBroker_InboundRecordOutboundTrim(t *testing.T) {
 		}
 		_ = outBackendW.Close()
 	}()
-	go func() { _ = b.pump(id, "test", Outbound, inflight, backendSrc, clientDst, b.outbound) }()
+	go func() { _ = b.pump(id, "test", Outbound, inflight, nil, backendSrc, clientDst, b.outbound) }()
 
 	gotResps := readAllMessages(t, clientDst, len(backendResps))
 
@@ -146,6 +147,52 @@ func outboundTrimStage(t *testing.T, b *Broker) *TrimStage {
 	}
 	t.Fatal("outbound pipeline has no TrimStage")
 	return nil
+}
+
+// TestBroker_ReclaimOnDisconnect drives a mutating tool-call through the real
+// inbound pump (acquiring a per-window write-lock), then ends the connection via
+// reclaim and confirms the lock is freed — the reclaim-on-death path wired
+// through the broker, not just the registry in isolation.
+func TestBroker_ReclaimOnDisconnect(t *testing.T) {
+	b, err := New(&config.Config{LockWaitSeconds: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.audit = audit.New(io.Discard)
+	// Tight bounded wait so the contention probe below is fast.
+	b.locks = newLockRegistry(time.Minute, 20*time.Millisecond)
+
+	id := identity.Identity{ID: "dying-agent", PID: 4242}
+	inflight := NewInflightMap()
+
+	// Feed one mutating click into the inbound pump.
+	clientReqR, clientReqW := io.Pipe()
+	backendR, backendW := io.Pipe()
+	clientSrc := mcp.NewConn(clientReqR, io.Discard)
+	backendDst := mcp.NewConn(backendR, backendW)
+
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"click","arguments":{"pid":4242,"window_id":7}}}`
+	go func() {
+		_, _ = clientReqW.Write([]byte(req + "\n"))
+		// Hold the connection open: the pump blocks on the next Read.
+	}()
+	go func() {
+		_ = b.pump(id, "test", Inbound, inflight, func(*mcp.Message) error { return nil }, clientSrc, backendDst, b.inbound)
+	}()
+
+	// The backend must receive the forwarded click (proving the lock was taken,
+	// not refused), and the lock is now held.
+	_ = readAllMessages(t, backendDst, 1)
+	key := windowKey{pid: 4242, windowID: 7}
+	if _, res := b.locks.Acquire(key, "probe"); res != timedOut {
+		t.Fatal("window should be held after the click acquired its lock")
+	}
+
+	// The caller dies: reclaim frees every lock it held.
+	b.reclaim(id)
+	if _, res := b.locks.Acquire(key, "next"); res != acquired {
+		t.Error("reclaim-on-death must free the dead caller's window-lock")
+	}
 }
 
 // readAllMessages reads exactly n messages off conn, failing on early EOF.

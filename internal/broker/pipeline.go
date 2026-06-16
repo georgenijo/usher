@@ -34,6 +34,18 @@ type Context struct {
 	// response kind (TrimStage on tools/call results) consume from it. Nil-safe:
 	// stages check for nil before use.
 	Inflight *InflightMap
+
+	// Locks is the shared per-window write-lock registry (#16). The inbound
+	// ArbitrateStage acquires; the outbound ArbitrateStage releases on the
+	// matching response. Nil-safe: ArbitrateStage forwards everything when nil.
+	Locks *lockRegistry
+
+	// Reply injects a message back toward the CLIENT, out of band of the normal
+	// forward. A stage on the inbound path that must refuse a request (e.g.
+	// ArbitrateStage answering a busy window with a JSON-RPC error) writes the
+	// error response here and returns (nil, nil) to drop the forward, so the
+	// agent gets an answer instead of hanging. Nil on the outbound path.
+	Reply func(*mcp.Message) error
 }
 
 // Stage is one step in the middleware pipeline. Process may inspect or transform

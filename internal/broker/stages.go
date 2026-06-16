@@ -34,19 +34,104 @@ func (s *GateStage) Name() string { return "gate" }
 // Process currently forwards unchanged.
 func (s *GateStage) Process(_ *Context, m *mcp.Message) (*mcp.Message, error) { return m, nil }
 
-// ArbitrateStage will acquire a per-window write-lock before a mutating action
-// and release it on the matching response; reads stay ungated; leases are TTL'd
-// and reclaimed on caller death. #16.
+// ErrWindowBusy is the JSON-RPC error code ArbitrateStage returns when a
+// mutating tool-call cannot acquire its window's write-lock within the bounded
+// wait. It is in the JSON-RPC server-error range (-32000..-32099), reserved for
+// application-defined errors, so it never collides with a protocol code.
+const ErrWindowBusy = -32010
+
+// ArbitrateStage enforces the per-window write-lock (#16). On the INBOUND path a
+// mutating tool-call (click, type_text, set_value, kill_app, …) acquires the
+// lock for its target window before the broker forwards it; read-only tools
+// (get_window_state, list_windows, zoom, …) and windowless tools pass straight
+// through. The lock key is stamped into the #15 inflight map so the OUTBOUND
+// pass of this same stage releases it on the matching response. Contention on the
+// same window serialises within a bounded wait; a window that stays busy past
+// that wait is refused with a JSON-RPC ErrWindowBusy answered straight back to
+// the client. Different windows never block each other; reads never block at all.
+//
+// Leases are TTL'd (a never-answered call frees its window) and the broker
+// reclaims an owner's locks when its connection ends, so neither a stuck backend
+// nor a vanished caller can wedge a window forever.
 type ArbitrateStage struct{}
 
-// NewArbitrateStage returns a pass-through arbitration stage.
+// NewArbitrateStage returns the arbitration stage. Its behaviour is driven by
+// ctx.Locks (the shared registry) and ctx.Dir; with a nil registry it forwards
+// everything, preserving the skeleton's pass-through.
 func NewArbitrateStage() *ArbitrateStage { return &ArbitrateStage{} }
 
 // Name identifies the stage.
 func (s *ArbitrateStage) Name() string { return "arbitrate" }
 
-// Process currently forwards unchanged.
-func (s *ArbitrateStage) Process(_ *Context, m *mcp.Message) (*mcp.Message, error) { return m, nil }
+// Process acquires (inbound) or releases (outbound) the per-window write-lock.
+func (s *ArbitrateStage) Process(ctx *Context, m *mcp.Message) (*mcp.Message, error) {
+	if ctx.Locks == nil {
+		return m, nil // skeleton/pass-through when arbitration is not wired
+	}
+	if ctx.Dir == Outbound {
+		return s.release(ctx, m)
+	}
+	return s.acquire(ctx, m)
+}
+
+// acquire runs on the inbound path. It locks the target window of a mutating
+// tool-call before the call is forwarded; everything else passes untouched.
+func (s *ArbitrateStage) acquire(ctx *Context, m *mcp.Message) (*mcp.Message, error) {
+	if !m.IsRequest() || m.Method != "tools/call" {
+		return m, nil // only tool-calls can target a window
+	}
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(m.Params, &p); err != nil {
+		return m, nil // unparseable params: forward, do not guess a lock
+	}
+	dec := classifyToolCall(p.Name, p.Arguments)
+	if !dec.needsLock {
+		return m, nil // read-only or windowless tool: ungated
+	}
+
+	owner := ctx.Identity.ID
+	token, result := ctx.Locks.Acquire(dec.key, owner)
+	if result == timedOut {
+		// Window stayed busy past the bounded wait. Refuse in-band so the agent
+		// gets a clear error rather than hanging on a never-arriving result, and
+		// drop the forward (returning nil) so the backend never sees the call.
+		busy := mcp.ErrorResponse(m.ID, ErrWindowBusy,
+			fmt.Sprintf("window busy: pid=%d window_id=%d held by another session",
+				dec.key.pid, dec.key.windowID))
+		if ctx.Reply != nil {
+			if err := ctx.Reply(busy); err != nil {
+				return nil, fmt.Errorf("arbitrate: reply busy: %w", err)
+			}
+		}
+		return nil, nil
+	}
+
+	// Stamp the lock onto the inflight entry the inbound pump already recorded,
+	// so the outbound pass releases exactly this lease on the matching response.
+	if ctx.Inflight != nil {
+		ctx.Inflight.SetLock(m.IDString(), dec.key, token)
+	}
+	return m, nil
+}
+
+// release runs on the outbound path. It frees the lock a request took, keyed by
+// the response id via the inflight map. Peek (not Consume) reads the entry so the
+// later TrimStage still finds it; Release is token-checked, so releasing a lease
+// already reclaimed by TTL or owner-death is a harmless no-op.
+func (s *ArbitrateStage) release(ctx *Context, m *mcp.Message) (*mcp.Message, error) {
+	if !m.IsResponse() || ctx.Inflight == nil {
+		return m, nil
+	}
+	entry, ok := ctx.Inflight.Peek(m.IDString())
+	if !ok || !entry.Locked {
+		return m, nil // no lock was taken for this request
+	}
+	ctx.Locks.Release(entry.LockKey, entry.LockToken)
+	return m, nil
+}
 
 // DefaultTrimThreshold is the size (in bytes of a text content item) at or
 // below which TrimStage leaves the result untouched. A small tool result (a

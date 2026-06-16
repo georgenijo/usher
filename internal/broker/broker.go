@@ -18,12 +18,14 @@ import (
 	"github.com/georgenijo/usher/internal/mcp"
 )
 
-// Broker holds the shared config and the two per-direction pipelines.
+// Broker holds the shared config, the per-window write-lock registry, and the
+// two per-direction pipelines.
 type Broker struct {
 	cfg      *config.Config
 	audit    *audit.Logger
-	inbound  *Pipeline // client → backend
-	outbound *Pipeline // backend → client
+	locks    *lockRegistry // shared per-window write-locks (#16)
+	inbound  *Pipeline     // client → backend
+	outbound *Pipeline     // backend → client
 }
 
 // New builds a broker from config, logging audit to stderr.
@@ -34,11 +36,16 @@ func New(cfg *config.Config) (*Broker, error) {
 	if cfg.TrimThreshold > 0 {
 		trimThreshold = cfg.TrimThreshold
 	}
+	// The lock registry is process-wide so contention is arbitrated ACROSS
+	// connections — two agents driving the same window must serialise even
+	// though each has its own pair of pumps. Zero ttl/wait take the defaults.
+	locks := newLockRegistry(cfg.LockTTL(), cfg.LockWait())
 	return &Broker{
 		cfg:      cfg,
 		audit:    al,
+		locks:    locks,
 		inbound:  NewPipeline(NewGateStage(), NewArbitrateStage(), NewAuditStage(al, Inbound)),
-		outbound: NewPipeline(NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
+		outbound: NewPipeline(NewArbitrateStage(), NewTrimStageThreshold(trimThreshold), NewAuditStage(al, Outbound)),
 	}, nil
 }
 
@@ -68,11 +75,25 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 	// the outbound pump's stages consume it to recognize the response kind.
 	inflight := NewInflightMap()
 
+	// On any exit path, reclaim every write-lock this connection still holds so a
+	// caller that dies mid-action cannot wedge its target window for the next
+	// agent (reclaim-on-death, #16).
+	defer b.reclaim(id)
+
+	// Reply lets an inbound stage answer the client out of band — ArbitrateStage
+	// uses it to return a JSON-RPC busy error for a contended window instead of
+	// forwarding the call. It shares the client conn's serialized Write.
+	reply := func(m *mcp.Message) error { return client.Write(m) }
+
 	// Pump each direction in its own goroutine.
 	inboundDone := make(chan error, 1)  // client → backend ended
 	outboundDone := make(chan error, 1) // backend → client ended
-	go func() { inboundDone <- b.pump(id, be.Name, Inbound, inflight, client, sb.Conn(), b.inbound) }()
-	go func() { outboundDone <- b.pump(id, be.Name, Outbound, inflight, sb.Conn(), client, b.outbound) }()
+	go func() {
+		inboundDone <- b.pump(id, be.Name, Inbound, inflight, reply, client, sb.Conn(), b.inbound)
+	}()
+	go func() {
+		outboundDone <- b.pump(id, be.Name, Outbound, inflight, nil, sb.Conn(), client, b.outbound)
+	}()
 
 	select {
 	case <-ctx.Done():
@@ -96,12 +117,24 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 	}
 }
 
+// reclaim frees every write-lock still held by a connection that is ending, the
+// reclaim-on-death path. It is safe to call when nothing is held (a no-op) and
+// when the registry is nil (tests that bypass New).
+func (b *Broker) reclaim(id identity.Identity) {
+	if b.locks == nil {
+		return
+	}
+	if n := b.locks.ReleaseOwner(id.ID); n > 0 {
+		b.audit.Errorf(id.ID, "reclaimed %d held window-lock(s) on disconnect", n)
+	}
+}
+
 // pump reads from src, runs the pipeline, and writes survivors to dst. A
 // per-message pipeline error is logged and skipped; a read/write error ends the
 // pump (and the connection). On the inbound side it records each request's
 // method into inflight so outbound stages can correlate the response.
-func (b *Broker) pump(id identity.Identity, beName string, dir Direction, inflight *InflightMap, src, dst *mcp.Conn, pipe *Pipeline) error {
-	pctx := &Context{Identity: id, Backend: beName, Dir: dir, Inflight: inflight}
+func (b *Broker) pump(id identity.Identity, beName string, dir Direction, inflight *InflightMap, reply func(*mcp.Message) error, src, dst *mcp.Conn, pipe *Pipeline) error {
+	pctx := &Context{Identity: id, Backend: beName, Dir: dir, Inflight: inflight, Locks: b.locks, Reply: reply}
 	for {
 		m, err := src.Read()
 		if err != nil {

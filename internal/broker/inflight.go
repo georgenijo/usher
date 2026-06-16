@@ -12,6 +12,13 @@ import (
 type InflightEntry struct {
 	Method   string // JSON-RPC method, e.g. "tools/call", "tools/list"
 	ToolName string // params.name when Method == "tools/call", else ""
+
+	// Locked is set when ArbitrateStage took a per-window write-lock for this
+	// request (#16); the outbound ArbitrateStage releases LockKey with LockToken
+	// on the matching response. Zero-value (Locked=false) for ungated requests.
+	Locked    bool
+	LockKey   windowKey
+	LockToken uint64
 }
 
 // InflightMap correlates a request to its response. The broker sees responses
@@ -58,6 +65,39 @@ func (f *InflightMap) Consume(id string) (entry InflightEntry, ok bool) {
 	}
 	f.mu.Unlock()
 	return entry, ok
+}
+
+// Peek returns the entry for id WITHOUT removing it. The outbound ArbitrateStage
+// reads the lock fields with Peek so the later TrimStage can still Consume the
+// same entry — two outbound stages share one correlation entry, so the
+// destructive Consume must remain the last reader. ok is false for an unknown id.
+func (f *InflightMap) Peek(id string) (entry InflightEntry, ok bool) {
+	if id == "" {
+		return InflightEntry{}, false
+	}
+	f.mu.Lock()
+	entry, ok = f.m[id]
+	f.mu.Unlock()
+	return entry, ok
+}
+
+// SetLock stamps the per-window lock fields onto an already-recorded entry. The
+// inbound pump records the request's method before the pipeline runs; the
+// inbound ArbitrateStage then calls SetLock so the matching response can find
+// and release the lock. A no-op if id was never recorded (a request the broker
+// did not track), which cannot happen for a tools/call but is defensive.
+func (f *InflightMap) SetLock(id string, key windowKey, token uint64) {
+	if id == "" {
+		return
+	}
+	f.mu.Lock()
+	if e, ok := f.m[id]; ok {
+		e.Locked = true
+		e.LockKey = key
+		e.LockToken = token
+		f.m[id] = e
+	}
+	f.mu.Unlock()
 }
 
 // toolNameIf returns params.name for a tools/call request and "" otherwise, so

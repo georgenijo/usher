@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Backend is one registered MCP server behind the broker.
@@ -28,6 +29,34 @@ type Config struct {
 	// trim stage compacts an oversized AX-tree digest. Zero (the unset default)
 	// means use the broker's built-in DefaultTrimThreshold.
 	TrimThreshold int `json:"trimThreshold,omitempty"`
+
+	// LockTTLSeconds is how long a per-window write-lock may be held before the
+	// broker reclaims it from a backend that never answered (#16). Zero (unset)
+	// means use the broker's built-in default.
+	LockTTLSeconds int `json:"lockTtlSeconds,omitempty"`
+
+	// LockWaitSeconds is how long a contended writer waits for a busy window
+	// before the broker refuses the call with a JSON-RPC error (#16). Zero
+	// (unset) means use the broker's built-in default.
+	LockWaitSeconds int `json:"lockWaitSeconds,omitempty"`
+}
+
+// LockTTL is the configured write-lock lease as a Duration, or zero when unset
+// (the broker then applies its built-in default). A non-positive value is unset.
+func (c *Config) LockTTL() time.Duration {
+	if c.LockTTLSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.LockTTLSeconds) * time.Second
+}
+
+// LockWait is the configured contended-writer wait as a Duration, or zero when
+// unset (the broker then applies its built-in default).
+func (c *Config) LockWait() time.Duration {
+	if c.LockWaitSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(c.LockWaitSeconds) * time.Second
 }
 
 // StateDir is usher's single state directory (config, socket, audit log).
