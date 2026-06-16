@@ -141,6 +141,8 @@ func TestConfigRoundTrip(t *testing.T) {
 			{Name: "db", Transport: "stdio", Command: []string{"db-mcp"}, Auth: "env", EnvKeys: []string{"ANTHROPIC_API_KEY"}},
 		},
 		TrimThreshold: 2048,
+		UIAddr:        "127.0.0.1:9000",
+		UIOff:         true,
 	}
 	if err := in.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)

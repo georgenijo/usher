@@ -51,6 +51,8 @@ func main() {
 		err = cmdStop(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "ui":
+		err = cmdUI(os.Args[2:])
 	case "install":
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
@@ -79,12 +81,19 @@ usage:
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
   usher status                      print daemon status (running/stopped/stale + UI url)
+  usher ui                          open the control-plane dashboard in the browser
   usher install [--backend NAME]    install + load the launchd LaunchAgent
   usher uninstall                   unload + remove the launchd LaunchAgent
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher version
+
+control-plane UI (served by serve --socket / start):
+  --ui-port N    bind the dashboard on 127.0.0.1:N (overrides config.uiAddr)
+  --ui-off       disable the dashboard (serve MCP only)
+  USHER_UI_ADDR  loopback host:port override (validated; rejects routable hosts)
+  config.json: "uiAddr": "127.0.0.1:7187", "uiOff": false
 
 backend add flags:
   --transport stdio|http   transport (http is validated-but-stubbed)
@@ -106,6 +115,8 @@ func cmdServe(args []string) error {
 	all := fs.Bool("all", false, "aggregate ALL configured backends behind one connection")
 	backends := fs.String("backends", "", "comma-separated backends to aggregate (e.g. cua,fs)")
 	socket := fs.Bool("socket", false, "listen on the Unix socket in the state dir (daemon foreground)")
+	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
+	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -144,19 +155,30 @@ func cmdServe(args []string) error {
 		// connection-level audit subscriber (the SSE stream is the bus's other
 		// reader). A control-plane bind failure is a warning, not fatal: the broker
 		// still serves MCP without the UI.
+		//
+		// The UI can be turned off entirely (--ui-off or config.UIOff): the daemon
+		// still serves MCP over the socket but never binds the HTTP listener.
 		sv := b.EnsureSupervisor(ctx)
 		b.StartAuditSubscriber(ctx) // connection-level audit becomes a bus subscriber
-		ui := control.New(b.Bus(), sv, cfg)
-		ui.SetAddr(uiAddr())
-		if uiLn, lerr := ui.Listen(); lerr != nil {
-			fmt.Fprintf(os.Stderr, "usher: warning: control plane not started: %v\n", lerr)
+		if uiDisabled(cfg, *uiOff) {
+			fmt.Fprintln(os.Stderr, "usher: control plane disabled (--ui-off)")
 		} else {
-			go func() {
-				if serr := ui.Serve(ctx, uiLn); serr != nil {
-					fmt.Fprintf(os.Stderr, "usher: control plane stopped: %v\n", serr)
-				}
-			}()
-			fmt.Fprintf(os.Stderr, "usher: UI on http://%s\n", uiLn.Addr())
+			ui := control.New(b.Bus(), sv, cfg)
+			ui.SetAddr(uiAddr(cfg, *uiPort))
+			if uiLn, lerr := ui.Listen(); lerr != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: control plane not started: %v\n", lerr)
+			} else {
+				go func() {
+					if serr := ui.Serve(ctx, uiLn); serr != nil {
+						fmt.Fprintf(os.Stderr, "usher: control plane stopped: %v\n", serr)
+					}
+				}()
+				// Record the ACTUAL bound URL so `usher status`/`usher ui` (separate
+				// processes that can't see this run's --ui-port) report it exactly.
+				_ = os.WriteFile(config.UIURLPath(), []byte("http://"+uiLn.Addr().String()+"\n"), 0o644)
+				defer os.Remove(config.UIURLPath())
+				fmt.Fprintf(os.Stderr, "usher: UI on http://%s\n", uiLn.Addr())
+			}
 		}
 
 		return b.ServeSocket(ctx, *backendName, ln)
@@ -171,14 +193,87 @@ func cmdServe(args []string) error {
 	return b.ServeStdio(ctx, *backendName, os.Stdin, os.Stdout)
 }
 
-// uiAddr resolves the control-plane listen address: the USHER_UI_ADDR override
-// when set, else the package default. The control server validates it is loopback
-// before binding, so an override that names a routable host fails closed.
-func uiAddr() string {
+// uiAddr resolves the control-plane listen address with this precedence, highest
+// first: the --ui-port flag (port>0, on 127.0.0.1), the USHER_UI_ADDR env
+// override, config.UIAddr, then the package default. The control server still
+// validates the result is loopback before binding, so an override that names a
+// routable host fails closed. cfg may be nil (status reads it lazily).
+func uiAddr(cfg *config.Config, port int) string {
+	if port > 0 {
+		return fmt.Sprintf("127.0.0.1:%d", port)
+	}
 	if a := os.Getenv(control.EnvAddr); a != "" {
 		return a
 	}
+	if cfg != nil && cfg.UIAddr != "" {
+		return cfg.UIAddr
+	}
 	return control.DefaultAddr
+}
+
+// uiDisabled reports whether the control-plane UI is off, honoring the --ui-off
+// flag (force off for this run) over config.UIOff (the persistent default).
+func uiDisabled(cfg *config.Config, flagOff bool) bool {
+	if flagOff {
+		return true
+	}
+	return cfg != nil && cfg.UIOff
+}
+
+// uiURL is the dashboard URL the daemon serves, used by `usher ui` and
+// `usher status`. A running daemon records the address it ACTUALLY bound in the
+// state dir (config.UIURLPath), so a run started with --ui-port is reported
+// exactly even though this process can't see that flag; when the file is absent
+// (no daemon, or an older one) it falls back to resolving config + env.
+func uiURL(cfg *config.Config) string {
+	if b, err := os.ReadFile(config.UIURLPath()); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			return s
+		}
+	}
+	return "http://" + uiAddr(cfg, 0)
+}
+
+// cmdUI opens the control-plane dashboard in the default browser via macOS
+// `open`. It prints the resolved URL first (so the user has it even if `open`
+// is unavailable), then refuses early when the UI is disabled in config and
+// nudges the user when the daemon does not appear to be running — but still
+// opens, since the daemon may be starting or bound elsewhere.
+func cmdUI(args []string) error {
+	fs := flag.NewFlagSet("ui", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	if uiDisabled(cfg, false) {
+		return fmt.Errorf("control-plane UI is disabled in config (uiOff=true); enable it (remove uiOff) or run: usher serve --socket")
+	}
+
+	url := uiURL(cfg)
+	fmt.Println(url)
+
+	// Advisory: a not-running daemon means nothing is listening yet. Don't fail —
+	// the user may be about to start it, or it may be bound under launchd.
+	if pid, perr := readPID(config.PidPath()); perr != nil || !processAlive(pid) {
+		fmt.Fprintln(os.Stderr, "usher: warning: daemon does not appear to be running; start it with: usher start")
+	}
+
+	return openBrowser(url)
+}
+
+// openBrowser opens url in the default browser using the macOS `open` command
+// (stdlib-only; no x/browser dependency). A non-macOS host or a missing `open`
+// surfaces a clear error so the printed URL remains the fallback.
+func openBrowser(url string) error {
+	cmd := exec.Command("/usr/bin/open", url)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("open %s: %w (open it manually)", url, err)
+	}
+	return nil
 }
 
 // splitBackends parses a "cua,fs" list into names, trimming blanks. An empty

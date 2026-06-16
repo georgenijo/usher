@@ -104,6 +104,8 @@ func processAlive(pid int) bool {
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	backendName := fs.String("backend", "", "backend to route to (default: configured default)")
+	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
+	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -117,9 +119,17 @@ func cmdStart(args []string) error {
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
 	}
+	// Thread the UI flags through to the backgrounded `serve --socket` so a
+	// `usher start --ui-port N` / `--ui-off` takes effect on the detached daemon.
 	serveArgs := []string{"serve", "--socket"}
 	if *backendName != "" {
 		serveArgs = append(serveArgs, "--backend", *backendName)
+	}
+	if *uiPort > 0 {
+		serveArgs = append(serveArgs, "--ui-port", strconv.Itoa(*uiPort))
+	}
+	if *uiOff {
+		serveArgs = append(serveArgs, "--ui-off")
 	}
 	cmd := exec.Command(self, serveArgs...)
 	// Detach into a new session so the daemon is not killed when the parent shell
@@ -168,6 +178,7 @@ func cmdStop(args []string) error {
 		// Stale PID file: clean up so the next start is unobstructed.
 		removePID(config.PidPath())
 		_ = os.Remove(config.SocketPath())
+		_ = os.Remove(config.UIURLPath())
 		return fmt.Errorf("daemon not running (stale pid %d cleaned up)", pid)
 	}
 
@@ -186,6 +197,7 @@ func cmdStop(args []string) error {
 	}
 	removePID(config.PidPath())
 	_ = os.Remove(config.SocketPath())
+	_ = os.Remove(config.UIURLPath()) // clear the recorded dashboard URL
 	fmt.Printf("usher daemon stopped (pid %d)\n", pid)
 	return nil
 }
@@ -203,7 +215,17 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	if processAlive(pid) {
-		fmt.Printf("usher: running pid=%d socket=%s ui=http://%s\n", pid, config.SocketPath(), uiAddr())
+		// The running daemon records the URL it bound (config.UIURLPath); its
+		// presence is the source of truth for whether the UI is up, accurate even
+		// when the daemon was started with a runtime --ui-port / --ui-off this
+		// process never saw. Absent file → UI is off for this run.
+		ui := "off"
+		if b, rerr := os.ReadFile(config.UIURLPath()); rerr == nil {
+			if s := strings.TrimSpace(string(b)); s != "" {
+				ui = s
+			}
+		}
+		fmt.Printf("usher: running pid=%d socket=%s ui=%s\n", pid, config.SocketPath(), ui)
 		return nil
 	}
 	fmt.Printf("usher: stale pid file (pid=%d not running); run: usher stop\n", pid)

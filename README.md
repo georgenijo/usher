@@ -47,6 +47,47 @@ go build -o usher ./cmd/usher
 that spawns a stdio server can point at `usher serve` instead of the tool
 directly. Audit lines go to stderr.
 
+## Dashboard (control-plane UI)
+
+The always-on daemon (`usher serve --socket`, or backgrounded with
+`usher start`) also serves a **loopback-only** web dashboard: see connected
+backends and their state (stopped / starting / live / failed), start / stop /
+restart them, and watch who is calling which backend — including a backend
+**coming live** the first time an agent routes a call to it.
+
+```sh
+usher start            # background the daemon (socket + dashboard)
+usher status           # prints: running pid=… socket=… ui=http://127.0.0.1:7187
+usher ui               # open the dashboard in your browser (macOS `open`)
+usher stop             # stop the daemon (also stops the dashboard)
+```
+
+The dashboard binds `127.0.0.1` only — never a routable interface — because
+usher is a single-user local tool with no auth; loopback is the security
+boundary. Live updates ride a Server-Sent-Events stream; management actions are
+POSTs. The page is a single self-contained file embedded in the binary (no Node,
+no JS deps).
+
+Configure the port and on/off, highest precedence first:
+
+```sh
+usher start --ui-port 9000      # bind 127.0.0.1:9000 for this run
+usher start --ui-off            # serve MCP only; no dashboard
+USHER_UI_ADDR=127.0.0.1:9000 usher serve --socket   # env override (validated loopback)
+```
+
+```jsonc
+// ~/.usher/config.json — the persistent defaults (used by the launchd daemon)
+{
+  "uiAddr": "127.0.0.1:7187",   // loopback host:port; empty → built-in default
+  "uiOff": false                // true disables the dashboard entirely
+}
+```
+
+A non-loopback `uiAddr`/`USHER_UI_ADDR` is rejected at bind time, so the API can
+never be exposed on a routable host. If the port is taken the daemon logs a
+warning and still serves MCP over the socket.
+
 ## Install
 
 macOS only (launchd, the Keychain, the Accessibility tree behind its backends).
@@ -125,7 +166,8 @@ block-and-refuse path only.
 cmd/usher/         CLI entrypoint + subcommand dispatch
 internal/mcp/      JSON-RPC 2.0 framing over newline-delimited stdio
 internal/backend/  stdio backend (spawn an MCP server, bridge its stdio)
-internal/broker/   the front desk: pipeline + stages + serve loop
+internal/broker/   the front desk: pipeline + stages + serve loop + event bus
+internal/control/  loopback HTTP control plane (REST + SSE) + embedded dashboard
 internal/identity/ identity-at-connect
 internal/audit/    append-only message log
 internal/config/   backends + state dir

@@ -60,6 +60,18 @@ type Config struct {
 	// escape hatch for an operator who has accepted the risk of a destructive
 	// tool; the env override USHER_ALLOW_TOOLS adds to this set at serve time.
 	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// UIAddr is the loopback host:port the daemon's control-plane web UI binds
+	// (e.g. "127.0.0.1:7187"). Empty leaves the built-in default address. The
+	// daemon validates it is loopback before binding, so a routable host fails
+	// closed. The --ui-port flag and the USHER_UI_ADDR env var override this at
+	// serve time; this is the persistent default.
+	UIAddr string `json:"uiAddr,omitempty"`
+
+	// UIOff disables the control-plane web UI entirely: the daemon serves MCP
+	// over the socket but never binds the HTTP listener. The --ui-off flag forces
+	// this for a single run; this is the persistent default.
+	UIOff bool `json:"uiOff,omitempty"`
 }
 
 // EnvAllowTools is the environment variable that allow-lists destructive tools
@@ -111,6 +123,13 @@ func SocketPath() string { return filepath.Join(StateDir(), "usher.sock") }
 // a process-liveness check is how `usher status` distinguishes running from
 // stopped from stale, without a flock dependency.
 func PidPath() string { return filepath.Join(StateDir(), "usher.pid") }
+
+// UIURLPath is the file the daemon writes with the dashboard URL it actually
+// bound, so `usher status` and `usher ui` (separate processes that cannot see
+// the daemon's runtime --ui-port flag) report the live address rather than
+// re-deriving it from config. It is removed on clean shutdown alongside the PID
+// file; an absent file means the daemon never bound the UI (e.g. --ui-off).
+func UIURLPath() string { return filepath.Join(StateDir(), "usher.ui") }
 
 // cuaCommand is the default hands backend: the Cua Driver MCP server.
 func cuaCommand() []string {
