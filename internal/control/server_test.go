@@ -300,8 +300,20 @@ func TestIndex_ServesUI(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("GET / content-type = %q, want text/html", ct)
 	}
-	if !strings.Contains(rec.Body.String(), "EventSource") {
+	body := rec.Body.String()
+	if !strings.Contains(body, "EventSource") {
 		t.Fatal("served UI does not reference EventSource; embed may be wrong")
+	}
+	// The DONE criteria require a visible loopback-only note in the page.
+	if !strings.Contains(strings.ToLower(body), "loopback") {
+		t.Fatal("served UI is missing the loopback-only note")
+	}
+	// And it must be self-contained: no external CDN/script/style references, so
+	// the dashboard works with zero network access beyond the daemon itself.
+	for _, ref := range []string{"http://", "https://", "//cdn", "src=\"http", "href=\"http"} {
+		if strings.Contains(body, ref) {
+			t.Fatalf("served UI references an external asset (%q); must be self-contained", ref)
+		}
 	}
 }
 

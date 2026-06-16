@@ -21,6 +21,7 @@
   }
   header h1 { font-size: 16px; margin: 0; letter-spacing: 0.3px; }
   header .sub { color: var(--muted); font-size: 12px; }
+  header .note { border: 1px solid var(--border); border-radius: 5px; padding: 1px 7px; cursor: help; }
   header #conn { margin-left: auto; font-size: 12px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
   .dot.up { background: var(--live); }
@@ -56,6 +57,7 @@
 <header>
   <h1>usher</h1>
   <span class="sub">front desk — MCP broker</span>
+  <span class="sub note" title="The control plane binds 127.0.0.1 only — no auth, loopback is the boundary.">loopback-only (127.0.0.1)</span>
   <span id="conn"><span class="dot down"></span><span id="connText">connecting…</span></span>
 </header>
 <main>
@@ -218,11 +220,32 @@ function setConn(up) {
   $("connText").textContent = up ? "live" : "reconnecting…";
 }
 
+let reconnectTimer = null;
+
 function connect() {
   const es = new EventSource("/api/events");
 
-  es.addEventListener("open", () => setConn(true));
-  es.addEventListener("error", () => setConn(false));
+  es.addEventListener("open", () => {
+    setConn(true);
+    // On every (re)connect, re-seed from the REST endpoints so any state the UI
+    // missed while the stream was down is reconciled. The SSE snapshot frame
+    // covers most of it; this is the belt-and-braces for a long outage.
+    seed();
+  });
+
+  // EventSource auto-reconnects on a transient drop. But if the server closes the
+  // stream for good (daemon restart) the browser eventually flips it to CLOSED and
+  // stops — so when that happens we discard it and dial a fresh one with a small
+  // backoff. A still-CONNECTING source is left alone (native retry handles it).
+  es.addEventListener("error", () => {
+    setConn(false);
+    if (es.readyState === EventSource.CLOSED && reconnectTimer === null) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 2000);
+    }
+  });
 
   es.addEventListener("snapshot", (e) => applySnapshot(JSON.parse(e.data)));
 
