@@ -73,6 +73,9 @@ func TestUIDisabled(t *testing.T) {
 // TestUIURL asserts the dashboard URL is the http:// loopback form, defaulting
 // to the built-in address and honoring a config override.
 func TestUIURL(t *testing.T) {
+	// Isolate the state dir so uiURL can't read a real ~/.usher/usher.ui left by a
+	// running daemon, which would shadow the config value this test asserts.
+	t.Setenv("USHER_STATE_DIR", t.TempDir())
 	t.Setenv(control.EnvAddr, "")
 	if got, want := uiURL(&config.Config{}), "http://"+control.DefaultAddr; got != want {
 		t.Errorf("uiURL(default) = %q, want %q", got, want)

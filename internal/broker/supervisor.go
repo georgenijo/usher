@@ -291,14 +291,17 @@ func (sv *BackendSupervisor) EnsureLive(name string) (*managedBackend, error) {
 			return mb.resultAfterReady()
 
 		case StateStopping:
-			// A graceful stop is draining. Wait for it to reach Stopped, then retry.
+			// A graceful stop is draining. Stop always publishes a fresh ready
+			// channel before flipping to StateStopping (under the lock), so mb.ready
+			// is non-nil here by construction; we park on it, then retry from Stopped.
+			// A nil channel would be an impossible state — surface it loudly rather
+			// than busy-sleep, since spinning would mask the broken invariant.
 			ready := mb.ready
 			mb.mu.Unlock()
-			if ready != nil {
-				<-ready
-			} else {
-				time.Sleep(time.Millisecond)
+			if ready == nil {
+				return nil, fmt.Errorf("backend %q: StateStopping with nil ready channel (invariant violated)", name)
 			}
+			<-ready
 			continue
 		}
 		mb.mu.Unlock()
