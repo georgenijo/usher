@@ -4,93 +4,98 @@
 
 ### The MCP broker — one front desk every agent talks to.
 
+*Route. Trim. Arbitrate. Gate. Audit.* — an ordered middleware pipeline between your agents and their tools.
+
+<p>
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white">
+  <img alt="go" src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white">
+  <img alt="deps" src="https://img.shields.io/badge/deps-stdlib%20only-44cc11">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
+  <img alt="status" src="https://img.shields.io/badge/status-alpha-orange">
+</p>
+
 </div>
 
 ---
 
-`usher` is a standalone daemon that sits between AI agents and the MCP tool
-servers they drive. Instead of each agent wiring every tool itself, it talks to
-`usher`, which **routes** the call to the right backend, **trims** oversized
-responses, **arbitrates** claims on shared resources (the one Mac screen),
-**gates** destructive actions, and **audits** everything — an ordered
-middleware pipeline.
+```console
+$ usher backend add cua -- ~/.local/bin/cua-driver mcp
+registered backend "cua" -> [cua-driver mcp] (transport=stdio, auth=inherit, handshake: ok)
 
-It's the front desk for a small fleet of local agents. [GhostHands](https://github.com/georgenijo/ghosthands)
-(the macOS "hands") becomes one *backend* behind it; `agent-mesh` is the fleet
-bus alongside it.
+$ usher serve --backend cua          # any MCP client points here instead of the tool
+usher: client→backend  tools/call   id=7   click            #  arbitrate: window-locked
+usher: backend→client  result       id=7   42b
+usher: client→backend  tools/call   id=8   kill_app         #  gate: BLOCKED (-32020)
+```
 
-## Status
+Every local agent wires the same tools — the same screen, the same shell, the same
+risk. **usher** is the front desk they all check in at instead. One connection in,
+one routed call out, with a middleware pipeline in between that **trims** oversized
+responses, **arbitrates** the one Mac screen, **gates** destructive actions, and
+**audits** the lot. Verbatim-forward by default; substance only where you ask for it.
 
-**Skeleton (#14) + live pipeline.** Today `usher serve` is a working stdio proxy:
-it spawns a backend, forwards JSON-RPC verbatim in both directions, stamps an
-identity at connect, and audits every message. The substantive stages —
-`trim` (#15 ★), `arbitrate` (#16), and `gate` (#18) — are implemented; each
-falls back to pass-through until configured, so the verbatim-forward default
-holds. The handshake (`initialize`, `notifications/initialized`, `tools/list`)
-always crosses the pipeline untouched.
+> Built for a small fleet of local agents. [GhostHands](https://github.com/georgenijo/ghosthands)
+> (the macOS "hands") becomes one *backend* behind it; `agent-mesh` is the fleet bus alongside it.
 
-## Try it
+## How it works
+
+```
+                 ┌──────────────────────── usher ────────────────────────┐
+                 │                                                        │
+  agent  ──────▶ │   gate  ──▶  arbitrate  ──▶  audit   ──────────────▶   │ ──▶  backend
+ (MCP client)    │   block      window-lock     log                      │     (cua, fs, …)
+                 │                                                        │
+  agent  ◀────── │   audit  ◀──   trim    ◀──  arbitrate  ◀───────────    │ ◀──  backend
+                 │   log         compact       unlock                     │
+                 └────────────────────────────────────────────────────────┘
+              JSON-RPC over stdio / unix socket          stdio MCP servers
+```
+
+Two pipelines, one per direction. Each stage is pass-through until you configure it,
+so the default is a faithful proxy — and the MCP handshake (`initialize`,
+`notifications/initialized`, `tools/list`) always crosses untouched.
+
+| Stage | Direction | What it does |
+| --- | --- | --- |
+| 🚧 **gate** | in | Refuses destructive/irreversible `tools/call` by policy — the backend never sees them. |
+| 🔒 **arbitrate** | in / out | Per-window write-lock so two agents can't fight over one window. TTL lease, reclaim-on-death. |
+| ✂️ **trim** | out | Compacts an oversized Accessibility-tree digest down to the buttons + values a brain needs. |
+| 📒 **audit** | in / out | Append-only line for every message crossing the desk. |
+| 🧭 **route** | — | One connection fans out to many backends; tools are namespaced `backend__tool`. |
+
+## Quickstart
 
 ```sh
 go build -o usher ./cmd/usher
 ./usher version
 
-# register a backend (any stdio MCP server); cua is the default if none set
+# register any stdio MCP server as a backend (handshake-validated before it's saved)
 ./usher backend add cua -- ~/.local/bin/cua-driver mcp
 ./usher backend list
 
-# proxy an agent over stdio to that backend
+# proxy one agent over stdio to that backend …
 ./usher serve --backend cua
+
+# … or aggregate several behind one connection, tools namespaced by backend
+./usher serve --all
 ```
 
-`usher serve` reads JSON-RPC from stdin and writes to stdout, so any MCP client
-that spawns a stdio server can point at `usher serve` instead of the tool
-directly. Audit lines go to stderr.
+`usher serve` reads JSON-RPC from stdin and writes to stdout, so any MCP client that
+spawns a stdio server can point at `usher serve` instead of the tool directly. Audit
+lines go to stderr.
 
-## Dashboard (control-plane UI)
-
-The always-on daemon (`usher serve --socket`, or backgrounded with
-`usher start`) also serves a **loopback-only** web dashboard: see connected
-backends and their state (stopped / starting / live / failed), start / stop /
-restart them, and watch who is calling which backend — including a backend
-**coming live** the first time an agent routes a call to it.
+### Run it always-on
 
 ```sh
-usher start            # background the daemon (socket + dashboard)
-usher status           # prints: running pid=… socket=… ui=http://127.0.0.1:7187
-usher ui               # open the dashboard in your browser (macOS `open`)
-usher stop             # stop the daemon (also stops the dashboard)
+usher install     # register the launchd LaunchAgent (survives logout + crashes)
+usher status      # running pid=… socket=~/.usher/usher.sock
+usher stop        # … or start / uninstall
 ```
-
-The dashboard binds `127.0.0.1` only — never a routable interface — because
-usher is a single-user local tool with no auth; loopback is the security
-boundary. Live updates ride a Server-Sent-Events stream; management actions are
-POSTs. The page is a single self-contained file embedded in the binary (no Node,
-no JS deps).
-
-Configure the port and on/off, highest precedence first:
-
-```sh
-usher start --ui-port 9000      # bind 127.0.0.1:9000 for this run
-usher start --ui-off            # serve MCP only; no dashboard
-USHER_UI_ADDR=127.0.0.1:9000 usher serve --socket   # env override (validated loopback)
-```
-
-```jsonc
-// ~/.usher/config.json — the persistent defaults (used by the launchd daemon)
-{
-  "uiAddr": "127.0.0.1:7187",   // loopback host:port; empty → built-in default
-  "uiOff": false                // true disables the dashboard entirely
-}
-```
-
-A non-loopback `uiAddr`/`USHER_UI_ADDR` is rejected at bind time, so the API can
-never be exposed on a routable host. If the port is taken the daemon logs a
-warning and still serves MCP over the socket.
 
 ## Install
 
-macOS only (launchd, the Keychain, the Accessibility tree behind its backends).
+macOS only — usher leans on launchd, the Keychain, and the Accessibility tree behind
+its backends.
 
 ```sh
 # Homebrew (cask)
@@ -102,77 +107,67 @@ curl -fsSL https://raw.githubusercontent.com/georgenijo/usher/main/scripts/insta
 # from source
 go install github.com/georgenijo/usher/cmd/usher@latest
 
-usher install   # register the always-on launchd daemon
+usher install
 ```
 
-Releases are cut with [GoReleaser](.goreleaser.yaml) (a single universal binary
-+ per-arch tarballs, checksummed). Sign/notarize/publish are manual steps —
-see [RELEASING.md](./RELEASING.md).
+Releases are cut with [GoReleaser](.goreleaser.yaml) — one universal binary + per-arch
+tarballs, checksummed. See [RELEASING.md](./RELEASING.md).
 
-## Design
+## Gate — block destructive actions
 
-- **Single binary**, daemon + control CLI. State dir `~/.usher/` (override with
-  `USHER_STATE_DIR`).
-- **Go, stdlib-only** (no deps in the skeleton).
-- **No containers** for the broker — it fronts host-bound hands (macOS
-  Accessibility / Screen). Containers only ever sandbox untrusted backends.
-- **Arbitration** (#16): per-window write-lock, ungated reads, TTL lease +
-  reclaim-on-death. No RW-lock, no global lock, no preemption.
-- **Gate** (#18): block destructive/irreversible tool-calls by policy (below).
-- **Backend registration** (planned, #32): one path — transport
-  (`stdio`/`http`) × auth-strategy (`none`/`env`/`inherit`/`oauth`), Keychain
-  secrets, handshake-validated, namespaced.
+The inbound `gate` stage refuses destructive `tools/call` before the broker forwards
+them. A blocked call is never sent to the backend; the client gets a JSON-RPC error
+(`-32020`) carrying the original id, so the agent gets a clear answer instead of a
+silent drop. Reads, benign calls, and the whole handshake pass through.
 
-### Gate — block destructive actions (#18)
-
-The inbound `gate` stage refuses destructive/irreversible tool-calls before the
-broker forwards them. A blocked `tools/call` is never sent to the backend; the
-client gets a JSON-RPC error (code `-32020`) carrying the original request id, so
-the agent gets a clear answer instead of a silent drop. Read-only and benign
-calls, and the whole MCP handshake, pass through untouched.
-
-A built-in destructive set is blocked out of the box — `kill_app` (irreversible)
-plus the canonical web-DOM mutators `delete`, `remove`, `send`, `submit`,
-`purchase`. Tune it from config or the environment (names are **bare** tool
-names, never namespaced):
+Out of the box it blocks `kill_app` plus the canonical web-DOM mutators `delete`,
+`remove`, `send`, `submit`, `purchase`. Tune it (names are **bare**, never namespaced):
 
 ```jsonc
 // ~/.usher/config.json
 {
   "blockedTools": ["drag"],     // ADDED to the built-in set
-  "allowedTools": ["kill_app"]  // OVERRIDE: forwarded even though it is blocked
+  "allowedTools": ["kill_app"]  // OVERRIDE: forwarded even though it's blocked
 }
 ```
 
 ```sh
-# unblock destructive tools for a single run, without editing config
+# unblock for a single run, no config edit
 USHER_ALLOW_TOOLS=kill_app,submit usher serve --backend cua
 ```
 
-The allow-list always wins over the block-list, so an operator can let a specific
-destructive tool through after accepting the risk.
+The allow-list always wins, so an operator can let a specific destructive tool through
+after accepting the risk.
 
-**Deferred (still part of #18):** the *unified dashboard / "absorb monitor"* — a
-live view that surfaces gated calls for human approval — is **not** implemented.
-Nor is the *draft-before-destructive* confirmation flow (hold the call, ask, then
-re-emit on approval); that needs a held-message store and a `-32021`
-requires-confirmation code, and the `Policy` struct is shaped to grow a
-`RequireConfirmation` set for it later. Today's gate is the simpler
-block-and-refuse path only.
+## Design notes
+
+- **Single binary**, daemon + control CLI. State dir `~/.usher/` (override `USHER_STATE_DIR`).
+- **Go, stdlib-only** — zero dependencies.
+- **No containers for the broker** — it fronts host-bound hands (Accessibility / Screen).
+  Containers only ever sandbox untrusted backends.
+- **Backend registration**: transport (`stdio`/`http`) × auth (`none`/`env`/`inherit`/`oauth`),
+  secrets in the Keychain (only key *names* hit disk), handshake-validated, namespaced.
+- **Arbitration**: per-window write-lock, ungated reads, TTL lease + reclaim-on-death.
+  No RW-lock, no global lock, no preemption.
+
+> **Status — alpha.** The proxy, identity, audit, gate, arbitrate, trim, multi-backend
+> fanout, and the launchd daemon are live. Deferred: the unified approval dashboard and
+> the draft-before-destructive confirmation flow. `http` transport and `oauth` are
+> validated-but-stubbed.
 
 ## Layout
 
 ```
-cmd/usher/         CLI entrypoint + subcommand dispatch
+cmd/usher/         CLI entrypoint, subcommands, launchd lifecycle
 internal/mcp/      JSON-RPC 2.0 framing over newline-delimited stdio
 internal/backend/  stdio backend (spawn an MCP server, bridge its stdio)
-internal/broker/   the front desk: pipeline + stages + serve loop + event bus
-internal/control/  loopback HTTP control plane (REST + SSE) + embedded dashboard
-internal/identity/ identity-at-connect
+internal/broker/   the front desk: pipeline + stages + serve loop + fanout
+internal/identity/ identity-at-connect (peer-pid on the socket)
 internal/audit/    append-only message log
-internal/config/   backends + state dir
+internal/config/   backends, state dir, auth resolution
+internal/keychain/ macOS Keychain secrets (auth=env)
 ```
 
 ## License
 
-MIT.
+[MIT](./LICENSE).
