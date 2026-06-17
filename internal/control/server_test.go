@@ -270,6 +270,100 @@ func TestConnections_ReflectsEvents(t *testing.T) {
 	})
 }
 
+// TestResources_EmptyBeforeAnyTick verifies GET /api/resources answers a
+// well-formed empty payload (no nil slices, zeroed totals) before the sampler has
+// emitted anything — a fresh tab paints a clean panel rather than erroring.
+func TestResources_EmptyBeforeAnyTick(t *testing.T) {
+	srv := New(broker.NewHub(), nil, nil)
+
+	rec := doReq(t, srv, "GET", "/api/resources")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/resources status = %d, want 200", rec.Code)
+	}
+	var p resourcesPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatalf("decode resources: %v (body=%s)", err, rec.Body.String())
+	}
+	if p.Samples == nil {
+		t.Fatal("samples is null; want an empty array")
+	}
+	if len(p.Samples) != 0 {
+		t.Fatalf("pre-tick samples = %+v, want empty", p.Samples)
+	}
+	if p.Totals.BackendRSSMB != 0 || p.Totals.BackendChildCount != 0 {
+		t.Fatalf("pre-tick backend totals nonzero: %+v", p.Totals)
+	}
+}
+
+// TestResources_RollsUpByRole feeds one ResourceSampleEvent through the bus and
+// asserts GET /api/resources reflects the per-pid rows AND the per-role rollups:
+// backend RSS is the SUM of the two live backend pids (in MB), the dead backend
+// pid is excluded from both the total and the child count, and broker/client
+// totals are attributed to their own roles. This is the load-test headline
+// (total backend RSS) computed server-side.
+func TestResources_RollsUpByRole(t *testing.T) {
+	bus := broker.NewHub()
+	srv := New(bus, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.res.Watch(ctx, bus)
+	waitFor(t, func() bool { return bus.SubscriberCount() >= 1 })
+
+	// Two live backend children (1024 + 2048 KB = 3 MB), one DEAD backend (excluded
+	// from both total and count), one broker (512 KB), two clients (256 + 256 KB).
+	bus.Emit(broker.ResourceSampleEvent{
+		TS: time.Now(),
+		Procs: []broker.ProcStat{
+			{PID: 11, Role: "backend", Label: "cua#0", RSSKB: 1024, CPUPct: 1.5, Alive: true},
+			{PID: 12, Role: "backend", Label: "cua#1", RSSKB: 2048, CPUPct: 2.0, Alive: true},
+			{PID: 13, Role: "backend", Label: "cua#dead", RSSKB: 4096, Alive: false},
+			{PID: 99, Role: "broker", Label: "broker", RSSKB: 512, Alive: true},
+			{PID: 21, Role: "client", Label: "client-a", RSSKB: 256, Alive: true},
+			{PID: 22, Role: "client", Label: "client-b", RSSKB: 256, Alive: true},
+		},
+	})
+
+	var p resourcesPayload
+	waitFor(t, func() bool {
+		rec := doReq(t, srv, "GET", "/api/resources")
+		if rec.Code != http.StatusOK {
+			return false
+		}
+		p = resourcesPayload{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		return len(p.Samples) == 6
+	})
+
+	// Totals: per-role SUM of LIVE pids, in MB. Backend = (1024+2048)/1024 = 3.0;
+	// the dead 4096-KB row is excluded. Broker = 0.5; client = 512/1024 = 0.5.
+	const eps = 1e-9
+	if d := p.Totals.BackendRSSMB - 3.0; d > eps || d < -eps {
+		t.Fatalf("backendRSS_MB = %v, want 3.0", p.Totals.BackendRSSMB)
+	}
+	if p.Totals.BackendChildCount != 2 {
+		t.Fatalf("backendChildCount = %d, want 2 (dead pid excluded)", p.Totals.BackendChildCount)
+	}
+	if d := p.Totals.BrokerRSSMB - 0.5; d > eps || d < -eps {
+		t.Fatalf("brokerRSS_MB = %v, want 0.5", p.Totals.BrokerRSSMB)
+	}
+	if d := p.Totals.ClientRSSMB - 0.5; d > eps || d < -eps {
+		t.Fatalf("clientRSS_MB = %v, want 0.5", p.Totals.ClientRSSMB)
+	}
+	if p.Totals.ClientCount != 2 {
+		t.Fatalf("clientCount = %d, want 2", p.Totals.ClientCount)
+	}
+
+	// Per-pid rows carry the REST contract field names (name/rssMB/cpu) and are
+	// sorted role-then-name: backend rows first.
+	if p.Samples[0].Role != "backend" || p.Samples[0].Name != "cua#0" {
+		t.Fatalf("first sample = %+v, want backend cua#0 (sorted role-then-name)", p.Samples[0])
+	}
+	if d := p.Samples[0].RSSMB - 1.0; d > eps || d < -eps {
+		t.Fatalf("cua#0 rssMB = %v, want 1.0", p.Samples[0].RSSMB)
+	}
+}
+
 // TestConfig_ServesSnapshot verifies GET /api/config returns the config snapshot.
 func TestConfig_ServesSnapshot(t *testing.T) {
 	srv, _, cleanup := testServer(t, []string{"click"})

@@ -41,6 +41,7 @@ type Server struct {
 	bus  *broker.Hub
 	sv   *broker.BackendSupervisor
 	reg  *connRegistry
+	res  *resourceState
 	mux  *http.ServeMux
 	addr string
 
@@ -62,6 +63,7 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 		bus:         bus,
 		sv:          sv,
 		reg:         newConnRegistry(),
+		res:         newResourceState(),
 		mux:         http.NewServeMux(),
 		cfgSnapshot: cfgSnapshot,
 	}
@@ -76,6 +78,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleIndex)
 	s.mux.HandleFunc("GET /api/backends", s.handleBackends)
 	s.mux.HandleFunc("GET /api/connections", s.handleConnections)
+	s.mux.HandleFunc("GET /api/resources", s.handleResources)
 	s.mux.HandleFunc("GET /api/config", s.handleConfig)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.mux.HandleFunc("POST /api/backends/{name}/start", s.manage((*broker.BackendSupervisor).Start))
@@ -116,6 +119,7 @@ func (s *Server) SetAddr(addr string) { s.addr = addr }
 // daemon runs it in its own goroutine.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go s.reg.Watch(ctx, s.bus)
+	go s.res.Watch(ctx, s.bus)
 
 	srv := &http.Server{
 		Handler:           s.mux,
@@ -157,6 +161,16 @@ func (s *Server) handleBackends(w http.ResponseWriter, _ *http.Request) {
 // the registry tracks from the event bus (connID, agentPID, backend, openedAt).
 func (s *Server) handleConnections(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.reg.snapshot())
+}
+
+// handleResources answers GET /api/resources with the latest per-process
+// resource tick: the per-pid samples (pid, role, name, RSS in MB, CPU%) plus the
+// per-role rollups (total backend RSS, broker RSS, client RSS, and the live
+// backend-child count). Every number is a SUM OF PER-PID rows — never a machine
+// total. Before the first sampler tick (or with sampling off) it is a
+// well-formed empty payload, so the panel paints cleanly rather than erroring.
+func (s *Server) handleResources(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.res.snapshot())
 }
 
 // handleConfig answers GET /api/config with the config snapshot captured at New.

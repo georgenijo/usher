@@ -51,6 +51,19 @@
   #feed td { font-size: 12.5px; }
   .empty { padding: 16px; color: var(--muted); font-size: 13px; }
   .tool { color: var(--accent); }
+  /* RESOURCES headline: the big per-role RSS readouts (backend vs client). */
+  .headline { display: flex; flex-wrap: wrap; gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .stat { flex: 1 1 180px; background: #0b0d12; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }
+  .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .stat .value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 3px; }
+  .stat .value .unit { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .stat .sub2 { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+  .stat.backend .value { color: var(--accent); }
+  tr.dead td { opacity: 0.4; }
+  .role { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .role.backend { background: rgba(110,168,254,0.18); color: var(--accent); }
+  .role.client { background: rgba(63,185,80,0.18); color: var(--live); }
+  .role.broker { background: rgba(217,164,65,0.20); color: var(--starting); }
 </style>
 </head>
 <body>
@@ -78,6 +91,31 @@
   </section>
 
   <section>
+    <h2>Resources — per-process RSS by role</h2>
+    <div class="headline">
+      <div class="stat backend">
+        <div class="label">Total backend RSS</div>
+        <div class="value"><span id="backendRSS">—</span><span class="unit">MB</span></div>
+        <div class="sub2"><span id="backendCount">0</span> backend child(ren)</div>
+      </div>
+      <div class="stat">
+        <div class="label">Total client RSS</div>
+        <div class="value"><span id="clientRSS">—</span><span class="unit">MB</span></div>
+        <div class="sub2"><span id="clientCount">0</span> client(s)</div>
+      </div>
+      <div class="stat">
+        <div class="label">Broker RSS</div>
+        <div class="value"><span id="brokerRSS">—</span><span class="unit">MB</span></div>
+        <div class="sub2">usher daemon</div>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Role</th><th>PID</th><th>Name</th><th>RSS (MB)</th><th>CPU%</th></tr></thead>
+      <tbody id="resources"><tr><td colspan="5" class="empty">sampling off — start the daemon with <code>USHER_SAMPLE=1</code> (or <code>usher bench</code>)</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
     <h2>Live activity</h2>
     <table>
       <thead><tr><th>Time</th><th>Event</th><th>Conn</th><th>Backend</th><th>Tool / detail</th></tr></thead>
@@ -93,6 +131,7 @@ const $ = (id) => document.getElementById(id);
 const backends = new Map();      // name -> status object
 const stateEpoch = new Map();    // name -> monotonic counter, bumped per backend.state event
 const connections = new Map();   // connID -> conn object
+const resources = new Map();     // pid -> { pid, role, name, rssMB, cpu, alive }
 let feed = [];                   // recent activity rows (newest first)
 const FEED_MAX = 60;
 
@@ -158,6 +197,77 @@ function renderConnections() {
   ).join("");
 }
 
+// fmtMB formats a megabyte number with one decimal, or an em-dash when absent.
+function fmtMB(n) {
+  if (n == null || !isFinite(n)) return "—";
+  return n.toFixed(1);
+}
+
+// renderResources repaints the per-pid table (sorted role-then-name, dead rows
+// greyed) and the headline strip. Totals are recomputed from the live rows so
+// the SSE delta path (which carries no server-side rollup) and the snapshot path
+// (which does) agree — every number is a SUM OF PER-PID rows, never a system
+// total. Dead pids contribute 0 RSS and are not counted.
+function renderResources() {
+  const tb = $("resources");
+  const rows = [...resources.values()].sort((a, b) =>
+    a.role === b.role ? String(a.name).localeCompare(String(b.name)) : a.role.localeCompare(b.role));
+
+  let backendRSS = 0, clientRSS = 0, brokerRSS = 0, backendCount = 0, clientCount = 0;
+  for (const r of rows) {
+    if (!r.alive) continue;
+    if (r.role === "backend") { backendRSS += r.rssMB; backendCount++; }
+    else if (r.role === "client") { clientRSS += r.rssMB; clientCount++; }
+    else if (r.role === "broker") { brokerRSS += r.rssMB; }
+  }
+  $("backendRSS").textContent = rows.length ? fmtMB(backendRSS) : "—";
+  $("clientRSS").textContent = rows.length ? fmtMB(clientRSS) : "—";
+  $("brokerRSS").textContent = rows.length ? fmtMB(brokerRSS) : "—";
+  $("backendCount").textContent = backendCount;
+  $("clientCount").textContent = clientCount;
+
+  if (rows.length === 0) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">sampling off — start the daemon with <code>USHER_SAMPLE=1</code> (or <code>usher bench</code>)</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map((r) =>
+    '<tr' + (r.alive ? "" : ' class="dead"') + "><td>" +
+      '<span class="role ' + esc(r.role) + '">' + esc(r.role) + "</span></td>" +
+      "<td>" + esc(r.pid) + "</td>" +
+      "<td><code>" + esc(r.name) + "</code></td>" +
+      "<td>" + fmtMB(r.rssMB) + "</td>" +
+      "<td>" + (r.cpu != null ? r.cpu.toFixed(1) : "—") + "</td></tr>"
+  ).join("");
+}
+
+// applyResourceTick replaces the resource map from one full tick. Each tick is a
+// complete snapshot of the watched pids, so the map is REBUILT (not merged) —
+// that way a pid the sampler stopped watching disappears rather than lingering.
+// rows is normalized to the {pid,role,name,rssMB,cpu,alive} shape regardless of
+// whether it came from the REST/snapshot payload (already MB) or the raw
+// resource.sample delta (KB, divided here exactly once).
+function applyResourceTick(rows) {
+  resources.clear();
+  for (const r of rows) resources.set(r.pid, r);
+  renderResources();
+}
+
+// normSamples maps a REST/SSE-snapshot resources payload's samples (already in
+// MB, field names name/rssMB/cpu) into the canonical row shape.
+function normSamples(samples) {
+  return (samples || []).map((s) => ({
+    pid: s.pid, role: s.role, name: s.name, rssMB: s.rssMB, cpu: s.cpu, alive: !!s.alive,
+  }));
+}
+
+// normProcs maps a raw resource.sample event's procs (KB unit, field names
+// label/rssKB/cpuPct) into the canonical row shape, dividing KB→MB exactly once.
+function normProcs(procs) {
+  return (procs || []).map((p) => ({
+    pid: p.pid, role: p.role, name: p.label, rssMB: p.rssKB / 1024, cpu: p.cpuPct, alive: !!p.alive,
+  }));
+}
+
 function pushFeed(row) {
   feed.unshift(row);
   if (feed.length > FEED_MAX) feed.length = FEED_MAX;
@@ -200,6 +310,11 @@ async function seed() {
     for (const c of list) connections.set(c.connID, c);
     renderConnections();
   } catch (e) { /* ignore */ }
+  try {
+    const res = await fetch("/api/resources");
+    const data = await res.json();
+    applyResourceTick(normSamples(data.samples));
+  } catch (e) { /* SSE snapshot will fill in */ }
 }
 
 function applySnapshot(data) {
@@ -212,6 +327,9 @@ function applySnapshot(data) {
     connections.clear();
     for (const c of data.connections) connections.set(c.connID, c);
     renderConnections();
+  }
+  if (data.resources && Array.isArray(data.resources.samples)) {
+    applyResourceTick(normSamples(data.resources.samples));
   }
 }
 
@@ -315,6 +433,14 @@ function connect() {
     const d = JSON.parse(e.data);
     pushFeed({ time: fmtTime(d.ts), kind: "lock", conn: d.connID, backend: "—",
       detail: (d.acquired ? "acquired " : "released ") + "<code>" + esc(d.key) + "</code>" });
+  });
+
+  // One full per-process resource tick: rebuild the resource table + headline.
+  // The frame carries the raw KB-unit procs shape (label/rssKB/cpuPct); normProcs
+  // divides KB→MB once. No feed row — a per-second tick would flood the log.
+  es.addEventListener("resource.sample", (e) => {
+    const d = JSON.parse(e.data);
+    applyResourceTick(normProcs(d.procs));
   });
 }
 

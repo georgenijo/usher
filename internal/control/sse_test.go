@@ -97,13 +97,18 @@ func TestSSE_DeliversEventThenCleansUp(t *testing.T) {
 
 	sr := newSSEReader(t, bufio.NewReader(resp.Body))
 
-	// First frame is the initial snapshot.
+	// First frame is the initial snapshot. It must carry the backend list, the
+	// connections, AND the resources payload so a fresh tab paints the RESOURCES
+	// panel (and its backend-RSS headline) from one frame.
 	ev, data := sr.frame()
 	if ev != "snapshot" {
 		t.Fatalf("first SSE event = %q, want snapshot (data=%s)", ev, data)
 	}
 	if !strings.Contains(data, "backends") {
 		t.Fatalf("snapshot frame missing backends: %s", data)
+	}
+	if !strings.Contains(data, `"resources"`) {
+		t.Fatalf("snapshot frame missing resources key: %s", data)
 	}
 
 	// The server must have a live subscriber now.
@@ -124,6 +129,45 @@ func TestSSE_DeliversEventThenCleansUp(t *testing.T) {
 	cancel()
 	resp.Body.Close()
 	waitFor(t, func() bool { return bus.SubscriberCount() == baseSubs })
+}
+
+// TestSSE_DeliversResourceSample asserts a ResourceSampleEvent flows over the
+// stream as `event: resource.sample` carrying the raw KB-unit procs shape the UI
+// converts to MB — proving the RESOURCES panel's live channel works end to end.
+func TestSSE_DeliversResourceSample(t *testing.T) {
+	bus := broker.NewHub()
+	srv := New(bus, nil, nil)
+
+	hs := httptest.NewServer(srv.Handler())
+	defer hs.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", hs.URL+"/api/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open SSE: %v", err)
+	}
+	defer resp.Body.Close()
+
+	sr := newSSEReader(t, bufio.NewReader(resp.Body))
+	if ev, _ := sr.frame(); ev != "snapshot" { // consume the snapshot frame
+		t.Fatalf("first frame = %q, want snapshot", ev)
+	}
+
+	waitFor(t, func() bool { return bus.SubscriberCount() >= 1 })
+
+	bus.Emit(broker.ResourceSampleEvent{
+		TS:    time.Now(),
+		Procs: []broker.ProcStat{{PID: 4242, Role: "backend", Label: "cua#0", RSSKB: 2048, CPUPct: 3.5, Alive: true}},
+	})
+	ev, data := sr.frame()
+	if ev != "resource.sample" {
+		t.Fatalf("delivered event = %q, want resource.sample (data=%s)", ev, data)
+	}
+	if !strings.Contains(data, `"type":"resource.sample"`) || !strings.Contains(data, `"rssKB":2048`) || !strings.Contains(data, `"role":"backend"`) {
+		t.Fatalf("resource.sample payload unexpected: %s", data)
+	}
 }
 
 // TestSSE_SnapshotWithNilBus asserts the snapshot frame arrives even with a nil

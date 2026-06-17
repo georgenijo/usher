@@ -90,8 +90,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// snapshotJSON renders the initial-frame payload: the current backend pool plus
-// the live connections, so a connecting client paints full state from one frame.
+// snapshotJSON renders the initial-frame payload: the current backend pool, the
+// live connections, and the latest per-process resource tick, so a connecting
+// client paints full state — including the RESOURCES panel and its backend-RSS
+// headline — from one frame without waiting for the next resource.sample delta.
 func (s *Server) snapshotJSON() []byte {
 	var backends []broker.BackendStatus
 	if s.sv != nil {
@@ -103,10 +105,11 @@ func (s *Server) snapshotJSON() []byte {
 	payload := struct {
 		Backends    []broker.BackendStatus `json:"backends"`
 		Connections []ConnInfo             `json:"connections"`
-	}{backends, s.reg.snapshot()}
+		Resources   resourcesPayload       `json:"resources"`
+	}{backends, s.reg.snapshot(), s.res.snapshot()}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return []byte(`{"backends":[],"connections":[]}`)
+		return []byte(`{"backends":[],"connections":[],"resources":{"samples":[],"totals":{}}}`)
 	}
 	return body
 }
