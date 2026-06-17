@@ -55,3 +55,12 @@ func (a *Logger) Message(id, dir, method, msgID string, nbytes int) {
 func (a *Logger) Errorf(id, format string, args ...any) {
 	a.l.Printf("error id=%s "+format, append([]any{id}, args...)...)
 }
+
+// Infof records an informational lifecycle line (prewarm, backend state
+// transitions, sampler start/stop) WITHOUT the error framing of Errorf, so a
+// healthy stopped→starting→live no longer reads as an "error" on the daemon's
+// stderr. tag is a subsystem label ("supervisor", "loadtest", "procstat")
+// rather than a connection id.
+func (a *Logger) Infof(tag, format string, args ...any) {
+	a.l.Printf("info tag=%s "+format, append([]any{tag}, args...)...)
+}

@@ -154,25 +154,35 @@ func (b *Broker) ServeStdio(ctx context.Context, backendName string, in io.Reade
 // or Accept fails for a non-shutdown reason.
 //
 // The daemon owns the shared BackendSupervisor (the pool): it is built here so
-// the control plane can list backends and drive their lifecycle, and the
-// configured backend is brought live through it on startup so the pool's state
-// machine and its BackendState events are the source of truth. The pool is torn
-// down on return so no shared child is orphaned.
-func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Listener) error {
+// the control plane can list backends and drive their lifecycle. By default the
+// pool starts LAZILY — no child is spawned until the first client's initialize
+// triggers come-live in serveMuxConn — so an idle daemon costs zero backend
+// processes (this is what the broker-vs-direct load test demonstrates). Passing
+// prewarm restores the eager start (the configured backend is brought live with
+// the daemon) for operators who want the first-call latency hidden. Either way
+// the pool's state machine and its BackendState events are the source of truth,
+// and the pool is torn down on return so no shared child is orphaned.
+func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Listener, prewarm bool) error {
 	defer ln.Close()
 
 	// Build the shared backend pool once per daemon, wired to this broker so each
-	// live child gets a backendMux for client multiplexing. EnsureLive lazily
-	// starts the shared child and runs its one-time handshake; a start failure is
-	// surfaced as a warning rather than aborting the daemon, since a later request
-	// can retry.
+	// live child gets a backendMux for client multiplexing.
 	if b.sv == nil {
 		b.sv = newSupervisorForBroker(ctx, b)
 	}
 	defer b.sv.StopAll()
-	if be := b.cfg.ResolveBackend(backendName); be != nil {
-		if _, err := b.sv.EnsureLive(be.Name); err != nil {
-			b.audit.Errorf("supervisor", "backend %q failed to come live: %v", be.Name, err)
+
+	// Lazy by default: the first client's initialize triggers come-live in
+	// serveMuxConn (its EnsureLive call). --prewarm opts back into the eager start
+	// — the child is born with the daemon — for operators who want the latency
+	// hidden before any client connects. A start failure is surfaced as a warning
+	// rather than aborting the daemon, since a later request can retry.
+	if prewarm {
+		if be := b.cfg.ResolveBackend(backendName); be != nil {
+			b.audit.Infof("supervisor", "prewarm: bringing %q live at daemon start", be.Name)
+			if _, err := b.sv.EnsureLive(be.Name); err != nil {
+				b.audit.Errorf("supervisor", "backend %q failed to come live: %v", be.Name, err)
+			}
 		}
 	}
 

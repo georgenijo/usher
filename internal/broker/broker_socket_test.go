@@ -94,7 +94,7 @@ func TestServeSocket_TwoConcurrentClients(t *testing.T) {
 	defer cancel()
 
 	srvDone := make(chan error, 1)
-	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln) }()
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, false) }()
 
 	// Drive one client end-to-end: initialize then tools/list, asserting valid
 	// responses correlated to the request ids.
@@ -200,7 +200,7 @@ func TestServeSocket_AcceptErrorIsCleanOnClose(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	srvDone := make(chan error, 1)
-	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln) }()
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, false) }()
 
 	// Cancel before any connection: the accept loop must unwind cleanly.
 	cancel()
@@ -208,6 +208,134 @@ func TestServeSocket_AcceptErrorIsCleanOnClose(t *testing.T) {
 	case err := <-srvDone:
 		if err != nil {
 			t.Errorf("ServeSocket = %v on clean shutdown, want nil", err)
+		}
+	case <-time.After(testDeadline):
+		t.Fatal("ServeSocket did not return after ctx cancel")
+	}
+}
+
+// TestServeSocket_LazyByDefault is the lazy-start done criterion: a daemon
+// started with prewarm=false spawns NO backend child — the pool's only backend
+// stays "stopped" — until the first client connects and sends initialize, which
+// triggers come-live (serveMuxConn's EnsureLive). After that one call the shared
+// child is "live". This is the zero-cost-idle property the broker-vs-direct load
+// test relies on.
+func TestServeSocket_LazyByDefault(t *testing.T) {
+	b := socketTestBroker(t, "fake", []string{"click"})
+	sockPath := shortSockPath(t)
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Build the supervisor in THIS goroutine before spawning ServeSocket, so the
+	// b.sv field write happens-before the accept loop reads it and the test can
+	// reach the pool without racing the field write (the cmd/usher daemon does the
+	// same: EnsureSupervisor then ServeSocket). ServeSocket reuses this pool since
+	// b.sv is already non-nil.
+	sv := b.EnsureSupervisor(ctx)
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, false) }()
+
+	// Lazy: no client has connected, so the backend must still be stopped — no
+	// child was spawned at daemon start.
+	if st, ok := sv.Find("fake"); !ok {
+		t.Fatalf("backend %q not in pool", "fake")
+	} else if st.State != "stopped" {
+		t.Fatalf("lazy daemon: backend state = %q before any client, want stopped", st.State)
+	}
+
+	// Connect one client and send initialize — this is the call that brings the
+	// shared child live.
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	r := bufio.NewReaderSize(conn, 1<<16)
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	m := readMsg(t, r)
+	if m.IDString() != "1" || len(m.Result) == 0 {
+		t.Fatalf("initialize response unexpected: id=%s result=%s err=%s", m.IDString(), m.Result, m.Error)
+	}
+
+	// After the first client's initialize the shared child is live (poll: the
+	// state flip happens in serveMuxConn around the response write).
+	live := false
+	for i := 0; i < 200; i++ {
+		if st, ok := sv.Find("fake"); ok && st.State == "live" {
+			live = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !live {
+		st, _ := sv.Find("fake")
+		t.Fatalf("after first client initialize: backend state = %q, want live", st.State)
+	}
+
+	cancel()
+	select {
+	case err := <-srvDone:
+		if err != nil {
+			t.Errorf("ServeSocket returned error on shutdown: %v", err)
+		}
+	case <-time.After(testDeadline):
+		t.Fatal("ServeSocket did not return after ctx cancel")
+	}
+}
+
+// TestServeSocket_Prewarm is the eager-start opt-in: a daemon started with
+// prewarm=true brings the configured default backend live AT DAEMON START,
+// before any client connects, so the shared child is already "live" when the
+// first call arrives (the first-call latency is hidden).
+func TestServeSocket_Prewarm(t *testing.T) {
+	b := socketTestBroker(t, "fake", []string{"click"})
+	sockPath := shortSockPath(t)
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Establish the pool in this goroutine first (see TestServeSocket_LazyByDefault)
+	// so reading it from the test does not race ServeSocket's b.sv write.
+	sv := b.EnsureSupervisor(ctx)
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, true) }()
+
+	// Prewarm runs the eager EnsureLive inline before the accept loop, so the
+	// backend should reach "live" with NO client ever connecting. Poll for it.
+	live := false
+	for i := 0; i < 400; i++ {
+		if st, ok := sv.Find("fake"); ok && st.State == "live" {
+			live = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !live {
+		var got string
+		if st, ok := sv.Find("fake"); ok {
+			got = st.State
+		}
+		t.Fatalf("prewarm daemon: backend state = %q before any client, want live", got)
+	}
+
+	cancel()
+	select {
+	case err := <-srvDone:
+		if err != nil {
+			t.Errorf("ServeSocket returned error on shutdown: %v", err)
 		}
 	case <-time.After(testDeadline):
 		t.Fatal("ServeSocket did not return after ctx cancel")

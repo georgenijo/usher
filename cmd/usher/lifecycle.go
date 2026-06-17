@@ -106,6 +106,7 @@ func cmdStart(args []string) error {
 	backendName := fs.String("backend", "", "backend to route to (default: configured default)")
 	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
 	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
+	prewarm := fs.Bool("prewarm", false, "prewarm the default backend at daemon start (default: lazy on first client)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -130,6 +131,9 @@ func cmdStart(args []string) error {
 	}
 	if *uiOff {
 		serveArgs = append(serveArgs, "--ui-off")
+	}
+	if *prewarm {
+		serveArgs = append(serveArgs, "--prewarm")
 	}
 	cmd := exec.Command(self, serveArgs...)
 	// Detach into a new session so the daemon is not killed when the parent shell

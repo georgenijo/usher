@@ -76,6 +76,7 @@ func usage() {
 usage:
   usher serve [--backend NAME]      proxy stdio MCP to a backend (the daemon)
   usher serve --socket [--backend N] listen on the Unix socket + loopback control UI
+                                    (backends start lazily on first client; --prewarm starts eager)
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
   usher start [--backend NAME]      launch the daemon in the background
@@ -117,6 +118,7 @@ func cmdServe(args []string) error {
 	socket := fs.Bool("socket", false, "listen on the Unix socket in the state dir (daemon foreground)")
 	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
 	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
+	prewarm := fs.Bool("prewarm", false, "bring the default backend live at daemon start instead of lazily on the first client")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -181,7 +183,7 @@ func cmdServe(args []string) error {
 			}
 		}
 
-		return b.ServeSocket(ctx, *backendName, ln)
+		return b.ServeSocket(ctx, *backendName, ln, *prewarm)
 	}
 
 	// Multi-backend aggregation is opt-in and additive; the default path is the

@@ -142,7 +142,7 @@ func startMuxDaemonBroker(t *testing.T, tools []string) (sockPath string, cancel
 	// without racing the field write.
 	b.EnsureSupervisor(ctx)
 	srvDone := make(chan error, 1)
-	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln) }()
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, false) }()
 	t.Cleanup(func() {
 		cancelFn()
 		select {
@@ -273,7 +273,7 @@ func TestMux_LockAcquireReleaseRoundTrip(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	srvDone := make(chan error, 1)
-	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln) }()
+	go func() { srvDone <- b.ServeSocket(ctx, "fake", ln, false) }()
 	t.Cleanup(func() {
 		cancel()
 		select {

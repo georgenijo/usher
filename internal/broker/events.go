@@ -254,7 +254,10 @@ func RunAuditSubscriber(ctx context.Context, bus *Hub, log *audit.Logger) {
 			case ConnCloseEvent:
 				log.DisconnectID(ev.ConnID, ev.Reason)
 			case BackendStateEvent:
-				log.Errorf(ev.Backend, "backend state %s→%s", ev.From, ev.To)
+				// A lifecycle transition (stopped→starting→live) is informational, not
+				// an error — log it via Infof so a healthy come-live no longer reads as
+				// "error" on the daemon's stderr.
+				log.Infof(ev.Backend, "backend state %s→%s", ev.From, ev.To)
 			}
 		}
 	}
