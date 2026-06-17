@@ -25,6 +25,7 @@ import (
 	"github.com/georgenijo/usher/internal/control"
 	"github.com/georgenijo/usher/internal/keychain"
 	"github.com/georgenijo/usher/internal/mcp"
+	"github.com/georgenijo/usher/internal/mcpserver"
 )
 
 // version is the build version. It is a var (not const) so the release build
@@ -43,6 +44,11 @@ func main() {
 		fmt.Printf("usher %s\n", version)
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "mcpserver":
+		// Homegrown hermetic stdio MCP server (echo/add/now). It is a guaranteed
+		// distinct backend TYPE usher can front; register it with:
+		//   usher backend add mcpserver -- /abs/path/to/usher mcpserver
+		err = mcpserver.Run(os.Stdin, os.Stdout)
 	case "backend":
 		err = cmdBackend(os.Args[2:])
 	case "start":
@@ -79,6 +85,8 @@ usage:
                                     (backends start lazily on first client; --prewarm starts eager)
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
+  usher mcpserver                   run the homegrown hermetic MCP server (echo/add/now)
+                                    register it: usher backend add mcpserver -- <usher path> mcpserver
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
   usher status                      print daemon status (running/stopped/stale + UI url)
