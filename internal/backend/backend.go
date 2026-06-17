@@ -73,6 +73,18 @@ func (s *Stdio) Start(ctx context.Context) error {
 // Name returns the backend's registered name.
 func (s *Stdio) Name() string { return s.name }
 
+// PID returns the running child's OS process id, or 0 before Start / after
+// Close. The supervisor surfaces it so the resource sampler can attribute
+// RSS/CPU to the shared backend child by pid (per-process, never a system
+// total). It reads cmd.Process directly, which is set by cmd.Start and stays
+// readable until Close reaps it.
+func (s *Stdio) PID() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
 // Conn is the JSON-RPC channel to the backend (valid after Start).
 func (s *Stdio) Conn() *mcp.Conn { return s.conn }
 

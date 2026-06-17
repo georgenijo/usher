@@ -101,13 +101,42 @@ type LockEvent struct {
 	Acquired bool      `json:"acquired"`
 }
 
-func (ConnOpenEvent) kind() string     { return "conn.open" }
-func (ConnCloseEvent) kind() string    { return "conn.close" }
-func (RequestEvent) kind() string      { return "request" }
-func (ResponseEvent) kind() string     { return "response" }
-func (BackendStateEvent) kind() string { return "backend.state" }
-func (GateBlockEvent) kind() string    { return "gate.block" }
-func (LockEvent) kind() string         { return "lock" }
+// ProcStat is one process's resources inside a ResourceSampleEvent: its pid, the
+// role it plays in the topology ("client"|"broker"|"backend"), a human label,
+// RSS in KILOBYTES (the macOS `ps -o rss=` unit, kept end-to-end so the UI
+// formats MB exactly once), CPU%, and whether ps still saw the pid alive this
+// tick. It is the wire form of procstat.ProcSample, redeclared here so the
+// broker event package does NOT import procstat (which would close an import
+// cycle — procstat imports nothing of usher's, and the daemon's sink converts
+// []procstat.ProcSample → []ProcStat at the emit site).
+type ProcStat struct {
+	PID    int     `json:"pid"`
+	Role   string  `json:"role"`
+	Label  string  `json:"label"`
+	RSSKB  int     `json:"rssKB"`
+	CPUPct float64 `json:"cpuPct"`
+	Alive  bool    `json:"alive"`
+}
+
+// ResourceSampleEvent carries ONE tick of per-process resources: a list of
+// per-pid rows, each tagged by role. The dashboard sums by role (total backend
+// RSS vs total client RSS, the broker-vs-direct load-test headline) — there is
+// deliberately NO machine-total field, because the thesis is about per-process
+// attribution, never a system reading. A full snapshot per tick (not a delta)
+// means a dropped frame on a slow SSE reader just shows stale-by-one numbers.
+type ResourceSampleEvent struct {
+	TS    time.Time  `json:"ts"`
+	Procs []ProcStat `json:"procs"`
+}
+
+func (ConnOpenEvent) kind() string       { return "conn.open" }
+func (ConnCloseEvent) kind() string      { return "conn.close" }
+func (RequestEvent) kind() string        { return "request" }
+func (ResponseEvent) kind() string       { return "response" }
+func (BackendStateEvent) kind() string   { return "backend.state" }
+func (GateBlockEvent) kind() string      { return "gate.block" }
+func (LockEvent) kind() string           { return "lock" }
+func (ResourceSampleEvent) kind() string { return "resource.sample" }
 
 // Kind exposes an event's wire tag to other packages (the SSE layer names the
 // SSE event after it). It is the exported view of the unexported kind().

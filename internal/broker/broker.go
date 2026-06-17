@@ -20,7 +20,23 @@ import (
 	"github.com/georgenijo/usher/internal/config"
 	"github.com/georgenijo/usher/internal/identity"
 	"github.com/georgenijo/usher/internal/mcp"
+	"github.com/georgenijo/usher/internal/procstat"
 )
+
+// sampleInterval is the cadence of the daemon's per-process resource sampler:
+// how often the gated USHER_SAMPLE path runs one `ps` batch over the watched
+// pids and emits a ResourceSampleEvent. One second is dense enough to watch a
+// backend come live / a client connect in the dashboard without flooding the
+// bus, and it matches the load harness's default poll cadence.
+const sampleInterval = time.Second
+
+// reconcileInterval is how often the backend-pid feeder polls sv.Snapshot() to
+// reconcile which shared children are live. It is finer than sampleInterval so a
+// backend that comes live (or dies) is reflected in the watch set within a
+// fraction of a sampler tick, rather than up to a full second late — the next ps
+// batch then attributes its RSS promptly. Polling a snapshot is cheap (no exec),
+// so the finer cadence costs nothing meaningful.
+const reconcileInterval = 200 * time.Millisecond
 
 // Broker holds the shared config, the per-window write-lock registry, the two
 // per-direction pipelines, the event bus, and (on the daemon path) the shared
@@ -184,6 +200,32 @@ func (b *Broker) ServeSocket(ctx context.Context, backendName string, ln net.Lis
 				b.audit.Errorf("supervisor", "backend %q failed to come live: %v", be.Name, err)
 			}
 		}
+	}
+
+	// Per-process resource sampler (gated by USHER_SAMPLE). It attributes RSS/CPU
+	// per pid — the broker self pid, each live shared backend child, and each
+	// connected client — and emits one ResourceSampleEvent per tick on the bus so
+	// the RESOURCES panel can watch the shared-pool flat line (backend RSS = 1×cua
+	// no matter how many clients connect). Off by default: a normal daemon spawns
+	// no `ps` calls and is byte-for-byte unchanged. Never a system total — only the
+	// pids the feeders register are sampled.
+	if sampleResourcesEnabled(b.cfg) {
+		sampler := procstat.New(sampleInterval, func(ss []procstat.ProcSample) {
+			procs := make([]ProcStat, len(ss))
+			for i, s := range ss {
+				procs[i] = ProcStat{
+					PID: s.PID, Role: s.Role, Label: s.Label,
+					RSSKB: s.RSSKB, CPUPct: s.CPUPct, Alive: s.Alive,
+				}
+			}
+			b.bus.Emit(ResourceSampleEvent{TS: time.Now(), Procs: procs})
+		})
+		// The broker's own pid is the one fixed target, registered once.
+		sampler.Set(procstat.Target{PID: os.Getpid(), Role: procstat.RoleBroker, Label: "broker"})
+		b.audit.Infof("procstat", "per-process resource sampler on (interval %s)", sampleInterval)
+		go sampler.Run(ctx)
+		go b.feedSamplerFromBus(ctx, sampler)      // client pids: ConnOpen/Close
+		go b.feedSamplerFromSnapshot(ctx, sampler) // backend pids: poll Snapshot()
 	}
 
 	// Close the listener on ctx cancel so the Accept loop unblocks and returns.
@@ -351,6 +393,124 @@ func (b *Broker) pump(id identity.Identity, beName string, dir Direction, inflig
 				TS: time.Now(), ConnID: id.ID, Backend: beName, RPCID: out.IDString(),
 				Bytes: outboundBytes(out), TrimmedFromBytes: preBytes,
 			})
+		}
+	}
+}
+
+// sampleResourcesEnabled reports whether the daemon should run the per-process
+// resource sampler. It is on when the config asks for it OR the USHER_SAMPLE env
+// var is truthy ("1"/"true"/"yes"/"on", case-insensitive) — the env form lets
+// the load harness flip it without editing config.json, mirroring how the gate's
+// allow-list is overridable at serve time.
+func sampleResourcesEnabled(cfg *config.Config) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(config.EnvSampleResources))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// feedSamplerFromBus translates connection lifecycle events into client targets
+// for the sampler: a ConnOpenEvent adds the connecting agent's pid (role=client),
+// a ConnCloseEvent removes it. ConnCloseEvent carries no pid, so the feeder keeps
+// a small ConnID→pid map of the connections it added and removes by ConnID on
+// close — this keeps the watch set from accumulating dead pids across many
+// connect/disconnect cycles. A pid shared by several connections (e.g. all the
+// load test's synthetic clients live in one harness process) is only Removed once
+// every ConnID using it has closed, so an active sibling connection is never
+// dropped from the sample.
+//
+// It is one Hub subscriber (256-buffered, drop-oldest like every other), so it
+// never back-pressures the forwarding path; a dropped ConnClose at worst leaves a
+// now-dead pid in the watch set, which the next tick reports as Alive:false. It
+// returns when ctx is cancelled or the hub closes the subscription.
+func (b *Broker) feedSamplerFromBus(ctx context.Context, sampler *procstat.Sampler) {
+	ch, cancel := b.bus.Subscribe(256)
+	defer cancel()
+	// byConn maps a live ConnID to its pid; refs counts how many open connections
+	// share each pid, so a pid is only Removed when its last connection closes.
+	byConn := make(map[string]int)
+	refs := make(map[int]int)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			switch ev := e.(type) {
+			case ConnOpenEvent:
+				if ev.PID <= 0 {
+					continue
+				}
+				// Ignore a duplicate open for a ConnID we already track (defensive; the
+				// broker emits one ConnOpen per connection).
+				if _, seen := byConn[ev.ConnID]; seen {
+					continue
+				}
+				byConn[ev.ConnID] = ev.PID
+				refs[ev.PID]++
+				sampler.Set(procstat.Target{
+					PID: ev.PID, Role: procstat.RoleClient, Label: "client-" + ev.ConnID,
+				})
+			case ConnCloseEvent:
+				pid, ok := byConn[ev.ConnID]
+				if !ok {
+					continue
+				}
+				delete(byConn, ev.ConnID)
+				if refs[pid]--; refs[pid] <= 0 {
+					delete(refs, pid)
+					sampler.Remove(pid) // last connection on this pid closed
+				}
+			}
+		}
+	}
+}
+
+// feedSamplerFromSnapshot keeps the sampler's BACKEND targets in sync with the
+// supervisor's live children by polling sv.Snapshot() every reconcileInterval —
+// the SAME []BackendStatus the UI reads, so the sampler stays decoupled from the
+// supervisor's internals. A backend that is live with a non-zero pid is Set
+// (role=backend); a backend that left live (its pid changed or dropped to 0) has
+// its previously-tracked pid Removed, so a restarted child's old pid does not
+// linger. It returns when ctx is cancelled.
+func (b *Broker) feedSamplerFromSnapshot(ctx context.Context, sampler *procstat.Sampler) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	// tracked maps a backend NAME to the pid we last registered for it, so a
+	// child that died or was replaced has its stale pid removed before the new one
+	// is added.
+	tracked := make(map[string]int)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if b.sv == nil {
+				continue
+			}
+			live := make(map[string]int)
+			for _, st := range b.sv.Snapshot() {
+				if st.State == "live" && st.PID > 0 {
+					live[st.Name] = st.PID
+				}
+			}
+			// Add/refresh live backends; remove ones whose pid changed or left live.
+			for name, pid := range live {
+				if old, ok := tracked[name]; ok && old != pid {
+					sampler.Remove(old)
+				}
+				sampler.Set(procstat.Target{PID: pid, Role: procstat.RoleBackend, Label: name})
+				tracked[name] = pid
+			}
+			for name, old := range tracked {
+				if _, ok := live[name]; !ok {
+					sampler.Remove(old)
+					delete(tracked, name)
+				}
+			}
 		}
 	}
 }

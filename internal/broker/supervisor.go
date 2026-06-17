@@ -147,6 +147,12 @@ func (mb *managedBackend) snapshot() BackendStatus {
 	if mb.state == StateLive {
 		st.StartedAt = mb.startedAt
 		st.ToolCount = countTools(mb.toolsResult)
+		// Surface the shared child's OS pid so the resource sampler can attribute
+		// per-process RSS/CPU to this backend. Zero (the field's default) when no
+		// child is live, which is the state the sampler treats as "not running".
+		if mb.child != nil {
+			st.PID = mb.child.PID()
+		}
 	}
 	if mb.err != nil {
 		st.Err = mb.err.Error()
@@ -163,7 +169,11 @@ type BackendStatus struct {
 	StartedAt time.Time `json:"startedAt,omitempty"`
 	Refs      int       `json:"refs"`
 	ToolCount int       `json:"toolCount"`
-	Err       string    `json:"err,omitempty"`
+	// PID is the live shared child's OS process id, or 0 when the backend is not
+	// live. The resource sampler reads it from Snapshot() to discover backend
+	// pids without reaching into the supervisor's internals.
+	PID int    `json:"pid"`
+	Err string `json:"err,omitempty"`
 }
 
 // BackendSupervisor owns the shared pool: one managedBackend per configured

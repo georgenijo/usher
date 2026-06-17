@@ -80,6 +80,15 @@ type Config struct {
 // allow-list, so a matching block is overridden for that run only.
 const EnvAllowTools = "USHER_ALLOW_TOOLS"
 
+// EnvSampleResources gates the daemon's per-process resource sampler: when set
+// to a truthy value ("1", "true") the socket daemon attributes RSS/CPU per pid
+// (broker self, shared backend children, connected clients) and emits a
+// ResourceSampleEvent per tick on the bus so the RESOURCES dashboard panel and
+// the broker-vs-direct load test can watch the shared-pool flat line. Off by
+// default so a normal daemon spawns no extra `ps` calls and is byte-for-byte
+// unchanged. The load harness always sets it.
+const EnvSampleResources = "USHER_SAMPLE"
+
 // LockTTL is the configured write-lock lease as a Duration, or zero when unset
 // (the broker then applies its built-in default). A non-positive value is unset.
 func (c *Config) LockTTL() time.Duration {

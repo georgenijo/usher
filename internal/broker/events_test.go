@@ -254,6 +254,40 @@ func TestMarshalEvent_InjectsType(t *testing.T) {
 	}
 }
 
+// TestMarshalEvent_ResourceSample asserts the per-process resource event splices
+// "type":"resource.sample" and carries its per-pid rows through intact (the
+// nested array survives the type splice, role-tagged, RSS in KB). It is the wire
+// contract the RESOURCES dashboard panel reads.
+func TestMarshalEvent_ResourceSample(t *testing.T) {
+	ev := ResourceSampleEvent{Procs: []ProcStat{
+		{PID: 42, Role: "backend", Label: "cua", RSSKB: 2048, CPUPct: 1.5, Alive: true},
+		{PID: 7, Role: "client", Label: "client-c1", RSSKB: 512, Alive: false},
+	}}
+	raw, err := MarshalEvent(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Type  string     `json:"type"`
+		Procs []ProcStat `json:"procs"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("invalid JSON %q: %v", raw, err)
+	}
+	if got.Type != "resource.sample" {
+		t.Errorf("type = %q, want resource.sample", got.Type)
+	}
+	if len(got.Procs) != 2 {
+		t.Fatalf("procs = %d rows, want 2 (per-pid rows must survive the splice)", len(got.Procs))
+	}
+	if got.Procs[0].PID != 42 || got.Procs[0].Role != "backend" || got.Procs[0].RSSKB != 2048 || !got.Procs[0].Alive {
+		t.Errorf("row 0 = %+v, want backend pid=42 rss=2048 alive", got.Procs[0])
+	}
+	if got.Procs[1].Role != "client" || got.Procs[1].Alive {
+		t.Errorf("row 1 = %+v, want client, not alive", got.Procs[1])
+	}
+}
+
 // TestBroker_PumpEmitsRequestAndResponse drives both pumps over in-memory pipes
 // against a real New-built broker (with the bus wired) and asserts the inbound
 // pump emits a Request event attributed to the right conn/pid/backend/tool, and
