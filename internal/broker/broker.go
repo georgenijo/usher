@@ -86,9 +86,18 @@ func (b *Broker) StartAuditSubscriber(ctx context.Context) {
 	go RunAuditSubscriber(ctx, b.bus, b.audit)
 }
 
-// New builds a broker from config, logging audit to stderr.
+// New builds a broker from config, logging audit to stderr at the default
+// (normal) verbosity — every line emits.
 func New(cfg *config.Config) (*Broker, error) {
-	al := audit.New(os.Stderr)
+	return NewWithLevel(cfg, audit.LevelNormal)
+}
+
+// NewWithLevel builds a broker from config, logging audit to stderr at the given
+// verbosity. `usher serve --quiet/--verbose` selects the level here; only the
+// informational Infof lifecycle lines are gated — errors, gate-blocked/security
+// lines, and the core per-message audit always emit (#log-verbosity).
+func NewWithLevel(cfg *config.Config, level audit.Level) (*Broker, error) {
+	al := audit.NewLevel(os.Stderr, level)
 	// A zero (unset) config threshold means "use the built-in default".
 	trimThreshold := DefaultTrimThreshold
 	if cfg.TrimThreshold > 0 {

@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/georgenijo/usher/internal/audit"
 	"github.com/georgenijo/usher/internal/backend"
 	"github.com/georgenijo/usher/internal/broker"
 	"github.com/georgenijo/usher/internal/config"
@@ -85,6 +86,8 @@ usage:
                                     (backends start lazily on first client; --prewarm starts eager)
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
+  usher serve --quiet               suppress info/lifecycle logs (errors + blocked + audit stay)
+  usher serve --verbose             full-detail logging
   usher mcpserver                   run the homegrown hermetic MCP server (echo/add/now)
                                     register it: usher backend add mcpserver -- <usher path> mcpserver
   usher start [--backend NAME]      launch the daemon in the background
@@ -127,8 +130,13 @@ func cmdServe(args []string) error {
 	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
 	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
 	prewarm := fs.Bool("prewarm", false, "bring the default backend live at daemon start instead of lazily on the first client")
+	quiet := fs.Bool("quiet", false, "suppress info/lifecycle log lines (errors, gate-blocked, and core audit still emit)")
+	verbose := fs.Bool("verbose", false, "full-detail logging (default verbosity plus any debug lines)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *quiet && *verbose {
+		return fmt.Errorf("--quiet and --verbose are mutually exclusive")
 	}
 
 	cfg, err := config.Load(config.DefaultPath())
@@ -139,7 +147,17 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	b, err := broker.New(cfg)
+	// Map the verbosity flags to the audit level; default is normal (the
+	// historical behavior). Only Infof lifecycle lines are gated (#log-verbosity).
+	level := audit.LevelNormal
+	switch {
+	case *quiet:
+		level = audit.LevelQuiet
+	case *verbose:
+		level = audit.LevelVerbose
+	}
+
+	b, err := broker.NewWithLevel(cfg, level)
 	if err != nil {
 		return err
 	}
