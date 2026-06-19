@@ -71,6 +71,8 @@ func main() {
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
 		err = cmdUninstall(os.Args[2:])
+	case "completion":
+		err = cmdCompletion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -114,6 +116,7 @@ usage:
   usher config check                validate config.json (no daemon); exits non-zero on error
   usher config init [--force]       scaffold a starter config.json (--force overwrites)
   usher doctor                      health-probe every registered backend (table; exit !=0 if any fail)
+  usher completion bash|zsh|fish    print a shell completion script to stdout
   usher version
 
 control-plane UI (served by serve --socket / start):
