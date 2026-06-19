@@ -12,6 +12,7 @@ import (
 
 	"github.com/georgenijo/usher/internal/config"
 	"github.com/georgenijo/usher/internal/mcp"
+	"github.com/georgenijo/usher/internal/mcpserver"
 )
 
 // The cmd/usher probe tests spawn a backend child process. Rather than depend on
@@ -40,6 +41,13 @@ func TestMain(m *testing.M) {
 // A child with no recognized mode falls through to "ok".
 func fakeBackendMain() {
 	mode := os.Getenv("USHER_FAKE_MODE")
+	// "mcpserver" runs the REAL bundled server (echo/add/now) so the selftest
+	// exercises the genuine backend end to end rather than the fake handshake
+	// below. It drives its own read loop over stdin/stdout, so branch before ours.
+	if mode == "mcpserver" {
+		_ = mcpserver.Run(os.Stdin, os.Stdout)
+		return
+	}
 	conn := mcp.NewConn(os.Stdin, os.Stdout)
 	for {
 		msg, err := conn.Read()

@@ -53,6 +53,11 @@ func main() {
 		// distinct backend TYPE usher can front; register it with:
 		//   usher backend add mcpserver -- /abs/path/to/usher mcpserver
 		err = mcpserver.Run(os.Stdin, os.Stdout)
+	case "selftest":
+		// Built-in end-to-end smoke test: drive the full MCP handshake plus one
+		// tools/call THROUGH the broker against the bundled mcpserver, in a temp
+		// state dir. PASS/FAIL with detail; exits non-zero on failure.
+		err = cmdSelftest(os.Args[2:])
 	case "backend":
 		err = cmdBackend(os.Args[2:])
 	case "config":
@@ -101,6 +106,7 @@ usage:
   usher serve --verbose             full-detail logging
   usher mcpserver                   run the homegrown hermetic MCP server (echo/add/now)
                                     register it: usher backend add mcpserver -- <usher path> mcpserver
+  usher selftest                    end-to-end broker smoke test (bundled backend, temp state dir)
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
   usher status [--json]             print daemon status (running/stopped/stale + UI url)
