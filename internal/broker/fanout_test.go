@@ -458,6 +458,53 @@ func TestServeMulti_SubsetByName(t *testing.T) {
 	}
 }
 
+// TestResolveBackends_SkipsDisabled is the selection-logic guard for the
+// per-backend disabled flag: a disabled backend is excluded from the --all
+// enumeration (names == nil) so it is never spawned, while a backend named
+// EXPLICITLY that is disabled errors clearly rather than being silently skipped.
+func TestResolveBackends_SkipsDisabled(t *testing.T) {
+	cfg := config.Config{Backends: []config.Backend{
+		{Name: "cua", Transport: "stdio", Command: []string{"true"}},
+		{Name: "fs", Transport: "stdio", Command: []string{"true"}, Disabled: true},
+	}}
+	b, err := New(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.audit = audit.New(io.Discard)
+
+	// --all (nil names): the disabled "fs" must be excluded.
+	out, err := b.resolveBackends(nil)
+	if err != nil {
+		t.Fatalf("resolveBackends(nil): %v", err)
+	}
+	if len(out) != 1 || out[0].Name != "cua" {
+		var names []string
+		for _, be := range out {
+			names = append(names, be.Name)
+		}
+		t.Errorf("--all selection = %v, want [cua] (fs disabled)", names)
+	}
+
+	// Naming the disabled backend explicitly must error, not silently skip it.
+	if _, err := b.resolveBackends([]string{"fs"}); err == nil {
+		t.Error("resolveBackends([fs]) on a disabled backend: want error, got nil")
+	}
+
+	// A disabled backend among an all-disabled config yields "no backend".
+	allOff := config.Config{Backends: []config.Backend{
+		{Name: "fs", Transport: "stdio", Command: []string{"true"}, Disabled: true},
+	}}
+	b2, err := New(&allOff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2.audit = audit.New(io.Discard)
+	if _, err := b2.resolveBackends(nil); err == nil {
+		t.Error("resolveBackends(nil) with every backend disabled: want error, got nil")
+	}
+}
+
 // TestServeStdio_BackCompatUnchanged is the regression guard for the legacy 1:1
 // path: ServeStdio against a single fake backend must forward tools/call with
 // the BARE tool name (no namespace prefix) and leave the request id untouched,

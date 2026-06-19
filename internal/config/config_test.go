@@ -243,3 +243,46 @@ func TestConfigRoundTrip(t *testing.T) {
 		t.Errorf("config.json missing the env key NAME; envKeys should be serialized:\n%s", raw)
 	}
 }
+
+// TestBackendDisabledRoundTrip: the Disabled flag survives a Save/Load cycle when
+// true, and is OMITTED from the on-disk bytes when false (omitempty) so existing
+// configs that never set it are byte-for-byte unchanged.
+func TestBackendDisabledRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	in := &Config{
+		Backends: []Backend{
+			{Name: "cua", Transport: "stdio", Command: []string{"cua-driver", "mcp"}, Auth: "inherit", Default: true},
+			{Name: "fs", Transport: "stdio", Command: []string{"fs-mcp"}, Auth: "none", Disabled: true},
+		},
+	}
+	if err := in.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("round-trip mismatch:\n in = %+v\nout = %+v", in, out)
+	}
+
+	fs := out.ResolveBackend("fs")
+	if fs == nil || !fs.Disabled {
+		t.Errorf("fs.Disabled = %v, want true", fs)
+	}
+
+	// The enabled backend ("cua", Disabled=false) must NOT serialize a "disabled"
+	// key — omitempty keeps pre-existing configs unchanged on disk.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"disabled": true`) {
+		t.Errorf("config.json missing the disabled flag for fs:\n%s", raw)
+	}
+	if strings.Count(string(raw), "disabled") != 1 {
+		t.Errorf("config.json has more than one \"disabled\" key; false should be omitted:\n%s", raw)
+	}
+}

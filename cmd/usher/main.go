@@ -424,7 +424,11 @@ func backendList() error {
 		if be.Default {
 			def = "*"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\n", be.Name, be.Transport, be.Auth, def, be.Command)
+		name := be.Name
+		if be.Disabled {
+			name += " (disabled)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\n", name, be.Transport, be.Auth, def, be.Command)
 	}
 	return w.Flush()
 }

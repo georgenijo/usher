@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,6 +187,34 @@ func TestConfigInit(t *testing.T) {
 	// --force overwrites without error.
 	if err := configInit([]string{"--force"}); err != nil {
 		t.Fatalf("configInit(--force) = %v, want nil", err)
+	}
+}
+
+// TestBackendListMarksDisabled: `usher backend list` annotates a disabled backend
+// with a trailing "(disabled)" marker while an enabled one is shown bare.
+func TestBackendListMarksDisabled(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	cfg := &config.Config{Backends: []config.Backend{
+		{Name: "cua", Transport: "stdio", Command: []string{"cua-driver"}, Auth: "inherit", Default: true},
+		{Name: "fs", Transport: "stdio", Command: []string{"fs-mcp"}, Auth: "none", Disabled: true},
+	}}
+	if err := cfg.Save(config.DefaultPath()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := backendList(); err != nil {
+			t.Fatalf("backendList: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "fs (disabled)") {
+		t.Errorf("backend list missing disabled marker for fs:\n%s", out)
+	}
+	if strings.Contains(out, "cua (disabled)") {
+		t.Errorf("backend list wrongly marked enabled cua as disabled:\n%s", out)
 	}
 }
 
