@@ -190,3 +190,83 @@ func TestBackendAddValidation(t *testing.T) {
 		t.Errorf("config.json exists after only-rejected adds (err=%v); validation should precede Save", err)
 	}
 }
+
+// TestBackendList_JSON: `usher backend list --json` emits a JSON array whose
+// entries carry the expected fields and never leak secret VALUES (only envKeys
+// names). The default (no --json) still prints the human table.
+func TestBackendList_JSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	cfg := &config.Config{}
+	cfg.Add(config.Backend{
+		Name:      "fs",
+		Transport: "stdio",
+		Auth:      "inherit",
+		Command:   []string{"/usr/bin/fs-mcp", "--root", "/tmp"},
+	}, true)
+	cfg.Add(config.Backend{
+		Name:      "api",
+		Transport: "stdio",
+		Auth:      "env",
+		Command:   []string{"/usr/bin/api-mcp"},
+		EnvKeys:   []string{"API_TOKEN"},
+	}, false)
+	if err := cfg.Save(config.DefaultPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := backendList([]string{"--json"}); err != nil {
+			t.Errorf("backendList(--json) = %v, want nil", err)
+		}
+	})
+
+	var got []backendListJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d backends, want 2: %+v", len(got), got)
+	}
+
+	fs := got[0]
+	if fs.Name != "fs" || fs.Transport != "stdio" || fs.Auth != "inherit" || !fs.Default {
+		t.Errorf("fs entry = %+v, want name=fs transport=stdio auth=inherit default=true", fs)
+	}
+	if len(fs.Command) != 3 || fs.Command[0] != "/usr/bin/fs-mcp" {
+		t.Errorf("fs command = %v, want the full argv", fs.Command)
+	}
+
+	api := got[1]
+	if api.Name != "api" || api.Auth != "env" || api.Default {
+		t.Errorf("api entry = %+v, want name=api auth=env default=false", api)
+	}
+	if len(api.EnvKeys) != 1 || api.EnvKeys[0] != "API_TOKEN" {
+		t.Errorf("api envKeys = %v, want [API_TOKEN]", api.EnvKeys)
+	}
+}
+
+// TestBackendList_JSON_Empty: with a config that has no backends, --json emits an
+// empty array (not `null`) so consumers can iterate unconditionally. (Load seeds
+// a default backend when NO file exists, so we persist an explicit empty config.)
+func TestBackendList_JSON_Empty(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+	if err := (&config.Config{}).Save(config.DefaultPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := backendList([]string{"--json"}); err != nil {
+			t.Errorf("backendList(--json) = %v, want nil", err)
+		}
+	})
+	var got []backendListJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("got %v, want an empty (non-nil) array", got)
+	}
+}

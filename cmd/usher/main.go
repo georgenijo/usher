@@ -89,11 +89,11 @@ usage:
                                     register it: usher backend add mcpserver -- <usher path> mcpserver
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
-  usher status                      print daemon status (running/stopped/stale + UI url)
+  usher status [--json]             print daemon status (running/stopped/stale + UI url)
   usher ui                          open the control-plane dashboard in the browser
   usher install [--backend NAME]    install + load the launchd LaunchAgent
   usher uninstall                   unload + remove the launchd LaunchAgent
-  usher backend list                show registered backends
+  usher backend list [--json]       show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher version
@@ -308,7 +308,7 @@ func cmdBackend(args []string) error {
 	}
 	switch args[0] {
 	case "list":
-		return backendList()
+		return backendList(args[1:])
 	case "add":
 		return backendAdd(args[1:])
 	case "probe":
@@ -318,11 +318,51 @@ func cmdBackend(args []string) error {
 	}
 }
 
-func backendList() error {
+// backendListJSON is the machine-readable shape of one registered backend, a
+// stable subset of config.Backend chosen for tooling (--json). It is a distinct
+// type so the on-disk config schema can evolve without silently changing the CLI
+// contract, and so secrets never leak: only the env-var NAMES (envKeys) appear,
+// never values (which live in the Keychain).
+type backendListJSON struct {
+	Name      string   `json:"name"`
+	Transport string   `json:"transport"`
+	Auth      string   `json:"auth"`
+	Command   []string `json:"command,omitempty"`
+	EnvKeys   []string `json:"envKeys,omitempty"`
+	Default   bool     `json:"default"`
+}
+
+func backendList(args []string) error {
+	fs := flag.NewFlagSet("backend list", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "emit a JSON array of backends instead of a table")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	cfg, err := config.Load(config.DefaultPath())
 	if err != nil {
 		return err
 	}
+
+	// --json: a JSON array of backends for scripting. Always emit an array (never
+	// `null`) so consumers can iterate unconditionally even with no backends.
+	if *asJSON {
+		out := make([]backendListJSON, 0, len(cfg.Backends))
+		for _, be := range cfg.Backends {
+			out = append(out, backendListJSON{
+				Name:      be.Name,
+				Transport: be.Transport,
+				Auth:      be.Auth,
+				Command:   be.Command,
+				EnvKeys:   be.EnvKeys,
+				Default:   be.Default,
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tDEFAULT\tCOMMAND")
 	for _, be := range cfg.Backends {

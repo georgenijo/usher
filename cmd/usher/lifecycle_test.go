@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -151,5 +152,77 @@ func TestListenUnix_StaleFile(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("socket perm = %o, want 600", perm)
+	}
+}
+
+// TestCmdStatus_JSON_Stopped: with no PID file, `status --json` must emit a JSON
+// object whose state is "stopped".
+func TestCmdStatus_JSON_Stopped(t *testing.T) {
+	t.Setenv("USHER_STATE_DIR", t.TempDir())
+	out := captureStdout(t, func() {
+		if err := cmdStatus([]string{"--json"}); err != nil {
+			t.Errorf("cmdStatus(--json) = %v, want nil", err)
+		}
+	})
+	var got statusJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got.State != "stopped" {
+		t.Errorf("state = %q, want \"stopped\"", got.State)
+	}
+}
+
+// TestCmdStatus_JSON_Running: a PID file naming THIS (live) process must yield a
+// JSON object with state=running, the live pid, and the socket path.
+func TestCmdStatus_JSON_Running(t *testing.T) {
+	t.Setenv("USHER_STATE_DIR", t.TempDir())
+	if err := writePID(config.PidPath(), os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := cmdStatus([]string{"--json"}); err != nil {
+			t.Errorf("cmdStatus(--json) = %v, want nil", err)
+		}
+	})
+	var got statusJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got.State != "running" {
+		t.Errorf("state = %q, want \"running\"", got.State)
+	}
+	if got.PID != os.Getpid() {
+		t.Errorf("pid = %d, want %d", got.PID, os.Getpid())
+	}
+	if got.Socket != config.SocketPath() {
+		t.Errorf("socket = %q, want %q", got.Socket, config.SocketPath())
+	}
+	if got.UI == "" {
+		t.Errorf("ui = empty, want a value (\"off\" or a URL)")
+	}
+}
+
+// TestCmdStatus_JSON_Stale: a PID file naming a dead process must yield state
+// "stale" carrying that pid.
+func TestCmdStatus_JSON_Stale(t *testing.T) {
+	t.Setenv("USHER_STATE_DIR", t.TempDir())
+	if err := writePID(config.PidPath(), 2147480000); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := cmdStatus([]string{"--json"}); err != nil {
+			t.Errorf("cmdStatus(--json) = %v, want nil", err)
+		}
+	})
+	var got statusJSON
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if got.State != "stale" {
+		t.Errorf("state = %q, want \"stale\"", got.State)
+	}
+	if got.PID != 2147480000 {
+		t.Errorf("pid = %d, want 2147480000", got.PID)
 	}
 }
