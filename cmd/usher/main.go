@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -94,6 +95,7 @@ usage:
   usher install [--backend NAME]    install + load the launchd LaunchAgent
   usher uninstall                   unload + remove the launchd LaunchAgent
   usher backend list                show registered backends
+  usher backend show NAME           inspect one backend in detail
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher version
@@ -304,17 +306,19 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add|probe> ...")
+		return fmt.Errorf("usage: usher backend <list|show|add|probe> ...")
 	}
 	switch args[0] {
 	case "list":
 		return backendList()
+	case "show":
+		return backendShow(args[1:])
 	case "add":
 		return backendAdd(args[1:])
 	case "probe":
 		return backendProbe(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|show|add|probe)", args[0])
 	}
 }
 
@@ -331,6 +335,79 @@ func backendList() error {
 			def = "*"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\n", be.Name, be.Transport, be.Auth, def, be.Command)
+	}
+	return w.Flush()
+}
+
+// keychainGet is the indirection backendShow uses to report whether each
+// auth=env secret is present in the Keychain. It is a variable so tests can
+// substitute an in-memory store and never touch the real Keychain; production
+// always uses keychain.Get.
+var keychainGet = keychain.Get
+
+// backendShow renders a detailed, read-only view of a single registered backend:
+// its name, transport, auth strategy, and (for stdio) the command + args. For
+// auth=env it lists each EnvKey NAME and whether the secret is present in the
+// Keychain (service usher.<name>) as "set" / "MISSING". The secret VALUE is
+// NEVER printed. Keychain lookups degrade gracefully: an unavailable Keychain
+// is reported as "unknown" rather than failing the command.
+func backendShow(args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return fmt.Errorf("usage: usher backend show NAME")
+	}
+	name := args[0]
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	// Match by exact name only — unlike ResolveBackend, "show" never falls back
+	// to the default backend, so an absent name is an unambiguous error.
+	var be *config.Backend
+	for i := range cfg.Backends {
+		if cfg.Backends[i].Name == name {
+			be = &cfg.Backends[i]
+			break
+		}
+	}
+	if be == nil {
+		return fmt.Errorf("no backend named %q", name)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintf(w, "Name:\t%s\n", be.Name)
+	fmt.Fprintf(w, "Transport:\t%s\n", be.Transport)
+	fmt.Fprintf(w, "Auth:\t%s\n", be.Auth)
+	fmt.Fprintf(w, "Default:\t%v\n", be.Default)
+	if be.Transport == "stdio" {
+		if len(be.Command) > 0 {
+			fmt.Fprintf(w, "Command:\t%s\n", be.Command[0])
+			if len(be.Command) > 1 {
+				fmt.Fprintf(w, "Args:\t%s\n", strings.Join(be.Command[1:], " "))
+			}
+		} else {
+			fmt.Fprintf(w, "Command:\t(none)\n")
+		}
+	}
+	if be.Auth == "env" {
+		if len(be.EnvKeys) == 0 {
+			fmt.Fprintf(w, "Env keys:\t(none)\n")
+		}
+		for i, k := range be.EnvKeys {
+			label := "Env keys:"
+			if i > 0 {
+				label = ""
+			}
+			// Report presence WITHOUT exposing the value: a found secret is
+			// "set", an absent one "MISSING", and a Keychain we cannot read
+			// (e.g. unavailable in the test/CI environment) "unknown".
+			status := "set"
+			if _, err := keychainGet(be.Name, k); errors.Is(err, keychain.ErrNotFound) {
+				status = "MISSING"
+			} else if err != nil {
+				status = "unknown"
+			}
+			fmt.Fprintf(w, "%s\t%s (%s)\n", label, k, status)
+		}
 	}
 	return w.Flush()
 }
