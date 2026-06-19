@@ -164,6 +164,34 @@ func Default() *Config {
 	}
 }
 
+// Starter is the config written by `usher config init`: a valid, parseable file
+// with an empty backends list. Unlike Default (which seeds the cua backend for an
+// unconfigured runtime), the scaffold hardcodes no backend — the operator adds
+// their own with `usher backend add`. encoding/json has no comments, so the file
+// carries no inline guidance; the init command prints next-steps to stderr.
+func Starter() *Config {
+	return &Config{Backends: []Backend{}}
+}
+
+// ErrConfigExists is returned by Init when a config already lives at the target
+// path and the caller did not request an overwrite. The init command turns this
+// into a refusal that points the operator at --force.
+var ErrConfigExists = errors.New("config already exists")
+
+// Init scaffolds a starter config at path. It creates the enclosing state dir if
+// missing. When a config already exists it refuses with ErrConfigExists unless
+// force is set, in which case the existing file is overwritten.
+func Init(path string, force bool) error {
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s: %w", path, ErrConfigExists)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return Starter().Save(path)
+}
+
 // Load reads the config at path, or returns the built-in Default when the file
 // does not exist. A malformed file is an error (don't silently mask it).
 func Load(path string) (*Config, error) {

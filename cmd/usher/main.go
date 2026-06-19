@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -51,6 +52,8 @@ func main() {
 		err = mcpserver.Run(os.Stdin, os.Stdout)
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -96,6 +99,7 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher config init [--force]       scaffold a starter config.json (--force overwrites)
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -316,6 +320,49 @@ func cmdBackend(args []string) error {
 	default:
 		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
 	}
+}
+
+// cmdConfig handles the config control subcommands.
+func cmdConfig(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: usher config <init> ...")
+	}
+	switch args[0] {
+	case "init":
+		return configInit(args[1:])
+	default:
+		return fmt.Errorf("unknown config subcommand %q (want init)", args[0])
+	}
+}
+
+// configInit scaffolds a starter config.json at config.DefaultPath(). It refuses
+// to clobber an existing config unless --force is passed. The written JSON has no
+// comments (encoding/json can't emit them), so the next-steps hint goes to stderr
+// while the path written goes to stdout.
+func configInit(args []string) error {
+	fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite an existing config")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	path := config.DefaultPath()
+	if err := config.Init(path, *force); err != nil {
+		if errors.Is(err, config.ErrConfigExists) {
+			return fmt.Errorf("%w (pass --force to overwrite)", err)
+		}
+		return err
+	}
+
+	fmt.Println(path)
+	fmt.Fprintf(os.Stderr, `wrote starter config (empty backends list).
+
+next steps:
+  usher backend add NAME -- COMMAND...   register a backend
+  usher backend list                     show registered backends
+  usher serve --socket                   start the daemon
+`)
+	return nil
 }
 
 func backendList() error {
