@@ -86,9 +86,19 @@ func (b *Broker) StartAuditSubscriber(ctx context.Context) {
 	go RunAuditSubscriber(ctx, b.bus, b.audit)
 }
 
-// New builds a broker from config, logging audit to stderr.
+// New builds a broker from config, logging audit to stderr AND a rotating file
+// under the state dir. The file is an additional, durable copy: stderr behaviour
+// is unchanged. If the file sink cannot be opened (unwritable state dir), the
+// broker degrades to stderr-only rather than failing to start — audit is a
+// record, not a gate on serving.
 func New(cfg *config.Config) (*Broker, error) {
-	al := audit.New(os.Stderr)
+	var auditW io.Writer = os.Stderr
+	if sink, err := audit.NewFileSink(cfg.AuditPath(), cfg.AuditMaxBytes, cfg.AuditKeep); err != nil {
+		fmt.Fprintf(os.Stderr, "usher: audit file sink disabled: %v\n", err)
+	} else {
+		auditW = io.MultiWriter(os.Stderr, sink)
+	}
+	al := audit.New(auditW)
 	// A zero (unset) config threshold means "use the built-in default".
 	trimThreshold := DefaultTrimThreshold
 	if cfg.TrimThreshold > 0 {
