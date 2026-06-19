@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -51,6 +52,8 @@ func main() {
 		err = mcpserver.Run(os.Stdin, os.Stdout)
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -96,6 +99,7 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher doctor                      health-probe every registered backend (table; exit !=0 if any fail)
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -511,19 +515,144 @@ func backendProbe(args []string) error {
 	return nil
 }
 
+// cmdDoctor health-probes every registered backend and prints a status table —
+// the scriptable companion to `backend probe` (which targets one). It reuses the
+// shared probeBackendDetail engine: spawn, initialize (timed), tools/list. Each
+// backend is probed concurrently under its own ~10s deadline so one slow/hung
+// backend doesn't serialize the whole run. The process exits non-zero if any
+// backend fails, so `usher doctor && deploy` works in scripts.
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", 10*time.Second, "per-backend handshake timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	if len(cfg.Backends) == 0 {
+		fmt.Println("no backends registered (add one: usher backend add NAME -- CMD...)")
+		return nil
+	}
+
+	type row struct {
+		name    string
+		ok      bool
+		latency time.Duration
+		tools   int
+		errMsg  string
+	}
+	rows := make([]row, len(cfg.Backends))
+
+	var wg sync.WaitGroup
+	for i := range cfg.Backends {
+		be := &cfg.Backends[i]
+		rows[i].name = be.Name
+		// http (and other) transports can't be stdio-probed yet — mark, don't spawn.
+		if be.Transport != "stdio" {
+			rows[i].errMsg = fmt.Sprintf("transport %q not probeable (stdio only)", be.Transport)
+			continue
+		}
+		envExtra, eerr := config.EnvForBackend(be)
+		if eerr != nil {
+			rows[i].errMsg = eerr.Error()
+			continue
+		}
+		wg.Add(1)
+		go func(i int, be *config.Backend, envExtra []string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+			res, perr := probeBackendDetail(ctx, be, envExtra)
+			if perr != nil {
+				rows[i].errMsg = perr.Error()
+				return
+			}
+			rows[i].ok = true
+			rows[i].latency = res.Latency
+			rows[i].tools = res.Tools
+		}(i, be, envExtra)
+	}
+	wg.Wait()
+
+	failed := 0
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "BACKEND\tSTATUS\tLATENCY\tTOOLS\tERROR")
+	for _, r := range rows {
+		if r.ok {
+			fmt.Fprintf(w, "%s\tok\t%s\t%d\t\n", r.name, r.latency.Round(time.Millisecond), r.tools)
+			continue
+		}
+		failed++
+		fmt.Fprintf(w, "%s\tFAIL\t-\t-\t%s\n", r.name, r.errMsg)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	if failed > 0 {
+		return fmt.Errorf("%d of %d backend(s) failed health probe", failed, len(rows))
+	}
+	return nil
+}
+
 // probeBackend spawns the backend, completes the MCP initialize handshake, and
 // tears it down. It is the canonical validation gate for backend add/probe: on
 // success the caller can trust the command runs and speaks MCP. The context's
 // deadline (and exec.CommandContext under it) kills a backend that hangs or
-// never answers, so a long-lived daemon cannot wedge the probe.
+// never answers, so a long-lived daemon cannot wedge the probe. It is a thin
+// wrapper over probeBackendDetail (which add/probe don't need the metrics of).
 func probeBackend(ctx context.Context, be *config.Backend, envExtra []string) error {
+	_, err := probeBackendDetail(ctx, be, envExtra)
+	return err
+}
+
+// probeResult carries the measured outcome of a backend health probe: the
+// initialize round-trip latency and the tool count reported by tools/list.
+type probeResult struct {
+	Latency time.Duration // initialize request -> response round-trip
+	Tools   int           // tools advertised by tools/list (0 if it declines)
+}
+
+// probeBackendDetail spawns the backend, completes the MCP initialize handshake,
+// then lists its tools — measuring initialize latency and counting tools along
+// the way. It is the shared engine behind `backend add`/`backend probe` (which
+// only care that err == nil) and `usher doctor` (which renders the metrics).
+// A backend that hangs is bounded by the context deadline, never blocking Read
+// forever. The handshake itself is never mutated — this is a plain MCP client.
+func probeBackendDetail(ctx context.Context, be *config.Backend, envExtra []string) (probeResult, error) {
+	var res probeResult
+
 	sb := backend.NewStdio(be.Name, be.Command, envExtra)
 	if err := sb.Start(ctx); err != nil {
-		return fmt.Errorf("start: %w", err)
+		return res, fmt.Errorf("start: %w", err)
 	}
 	defer sb.Close()
 
 	conn := sb.Conn()
+
+	// Read responses on a goroutine so a backend that never replies is bounded by
+	// the context deadline rather than blocking Read forever. One reader serves
+	// the whole probe sequence (initialize, then tools/list).
+	type readResult struct {
+		m   *mcp.Message
+		err error
+	}
+	read := func() (*mcp.Message, error) {
+		ch := make(chan readResult, 1)
+		go func() {
+			m, err := conn.Read()
+			ch <- readResult{m, err}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case r := <-ch:
+			return r.m, r.err
+		}
+	}
 
 	params := json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"usher","version":"` + version + `"}}`)
 	req := &mcp.Message{
@@ -532,41 +661,53 @@ func probeBackend(ctx context.Context, be *config.Backend, envExtra []string) er
 		Method:  "initialize",
 		Params:  params,
 	}
+	start := time.Now()
 	if err := conn.Write(req); err != nil {
-		return fmt.Errorf("write initialize: %w", err)
+		return res, fmt.Errorf("write initialize: %w", err)
 	}
 
-	// Read responses on a goroutine so a backend that never replies is bounded by
-	// the context deadline rather than blocking Read forever.
-	type readResult struct {
-		m   *mcp.Message
-		err error
+	m, err := read()
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, fmt.Errorf("initialize: %w", ctx.Err())
+		}
+		return res, fmt.Errorf("read initialize response: %w", err)
 	}
-	ch := make(chan readResult, 1)
-	go func() {
-		m, err := conn.Read()
-		ch <- readResult{m, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("initialize: %w", ctx.Err())
-	case r := <-ch:
-		if r.err != nil {
-			return fmt.Errorf("read initialize response: %w", r.err)
-		}
-		if len(r.m.Error) > 0 {
-			return fmt.Errorf("initialize error: %s", r.m.Error)
-		}
-		if len(r.m.Result) == 0 {
-			return fmt.Errorf("initialize returned no result (not an MCP server?)")
-		}
+	res.Latency = time.Since(start)
+	if len(m.Error) > 0 {
+		return res, fmt.Errorf("initialize error: %s", m.Error)
+	}
+	if len(m.Result) == 0 {
+		return res, fmt.Errorf("initialize returned no result (not an MCP server?)")
 	}
 
 	// The backend speaks MCP. Send notifications/initialized so it can finish its
-	// handshake cleanly, then close. tools/list is exercised at serve time.
+	// handshake cleanly.
 	_ = conn.Write(&mcp.Message{JSONRPC: "2.0", Method: "notifications/initialized"})
-	return nil
+
+	// Count tools via tools/list. A backend without a tools capability may reply
+	// with an error or no result; that's not a probe failure (the handshake is
+	// what proves MCP), so we leave Tools at 0 and return success.
+	listReq := &mcp.Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("2"),
+		Method:  "tools/list",
+		Params:  json.RawMessage(`{}`),
+	}
+	if err := conn.Write(listReq); err != nil {
+		return res, nil // handshake already proved MCP; report what we have
+	}
+	lm, err := read()
+	if err != nil || lm == nil || len(lm.Error) > 0 || len(lm.Result) == 0 {
+		return res, nil
+	}
+	var listResult struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if json.Unmarshal(lm.Result, &listResult) == nil {
+		res.Tools = len(listResult.Tools)
+	}
+	return res, nil
 }
 
 // readSecret reads a single secret line from the terminal with echo disabled, so

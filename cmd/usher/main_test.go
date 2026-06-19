@@ -41,6 +41,18 @@ func fakeBackendMain() {
 		if err != nil {
 			return // EOF / half-close
 		}
+		if msg.Method == "tools/list" {
+			// doctor counts these; a well-behaved "ok" backend advertises two
+			// tools. Other modes never get this far (they fail at initialize).
+			result, _ := json.Marshal(map[string]any{
+				"tools": []map[string]any{
+					{"name": "echo"},
+					{"name": "add"},
+				},
+			})
+			_ = conn.Write(&mcp.Message{JSONRPC: "2.0", ID: msg.ID, Result: result})
+			continue
+		}
 		if msg.Method != "initialize" {
 			continue // ignore notifications/initialized etc.
 		}
@@ -120,6 +132,56 @@ func TestProbeBackend(t *testing.T) {
 				t.Fatalf("probeBackend(%s) = %v, want nil", tc.name, err)
 			}
 		})
+	}
+}
+
+// TestProbeBackendDetail confirms the shared probe engine measures a non-zero
+// initialize latency and counts the tools an "ok" backend advertises.
+func TestProbeBackendDetail(t *testing.T) {
+	be := &config.Backend{Name: "fake", Transport: "stdio", Command: fakeBackendCommand(t, "ok"), Auth: "inherit"}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	res, err := probeBackendDetail(ctx, be, nil)
+	if err != nil {
+		t.Fatalf("probeBackendDetail(ok) = %v, want nil", err)
+	}
+	if res.Latency <= 0 {
+		t.Errorf("latency = %v, want > 0", res.Latency)
+	}
+	if res.Tools != 2 {
+		t.Errorf("tools = %d, want 2", res.Tools)
+	}
+}
+
+// TestCmdDoctor table-drives cmdDoctor over an isolated state dir. With only a
+// healthy backend it returns nil; once a backend that can't speak MCP is also
+// registered, doctor must return an error so the process exits non-zero.
+func TestCmdDoctor(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	cfg := &config.Config{Backends: []config.Backend{
+		{Name: "good", Transport: "stdio", Command: fakeBackendCommand(t, "ok"), Auth: "inherit"},
+	}}
+	if err := cfg.Save(config.DefaultPath()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// All healthy -> nil (exit 0).
+	if err := cmdDoctor([]string{"--timeout", "8s"}); err != nil {
+		t.Fatalf("cmdDoctor(all healthy) = %v, want nil", err)
+	}
+
+	// Add a backend that exits immediately (speaks no MCP) -> doctor must fail.
+	cfg.Backends = append(cfg.Backends, config.Backend{
+		Name: "bad", Transport: "stdio", Command: []string{"/usr/bin/false"}, Auth: "inherit",
+	})
+	if err := cfg.Save(config.DefaultPath()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := cmdDoctor([]string{"--timeout", "8s"}); err == nil {
+		t.Fatal("cmdDoctor(one failing) = nil, want error (must exit non-zero)")
 	}
 }
 
