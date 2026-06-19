@@ -102,6 +102,7 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend remove NAME         deregister a backend (alias: rm; purges auth=env Keychain keys)
+  usher backend rename OLD NEW      rename a backend + migrate its Keychain secrets
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher config check                validate config.json (no daemon); exits non-zero on error
   usher config init [--force]       scaffold a starter config.json (--force overwrites)
@@ -328,7 +329,7 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add|remove|probe> ...")
+		return fmt.Errorf("usage: usher backend <list|add|remove|rename|probe> ...")
 	}
 	switch args[0] {
 	case "list":
@@ -337,10 +338,12 @@ func cmdBackend(args []string) error {
 		return backendAdd(args[1:])
 	case "remove", "rm":
 		return backendRemove(args[1:])
+	case "rename":
+		return backendRename(args[1:])
 	case "probe":
 		return backendProbe(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add|remove|probe)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|add|remove|rename|probe)", args[0])
 	}
 }
 
@@ -414,11 +417,6 @@ next steps:
 `)
 	return nil
 }
-
-// keychainDelete is the indirection used by backendRemove to purge secrets. It
-// is a var so tests can substitute an in-memory store instead of shelling out to
-// the real Keychain; production always uses keychain.Delete.
-var keychainDelete = keychain.Delete
 
 // backendRemove deregisters the backend named in args[0] (alias `rm`). It loads
 // the config, removes the entry, and — for auth=env backends — purges each of
@@ -643,6 +641,94 @@ func backendAdd(args []string) error {
 		return err
 	}
 	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
+	return nil
+}
+
+// Keychain indirections used by backendRename and backendRemove so tests can
+// substitute an in-memory store and never touch the real login Keychain.
+// Production wires the real /usr/bin/security-backed implementations from
+// internal/keychain.
+var (
+	keychainGet    = keychain.Get
+	keychainSet    = keychain.Set
+	keychainDelete = keychain.Delete
+)
+
+// backendRename renames an already-registered backend from OLD to NEW and, when
+// the backend's auth strategy is env, migrates its secrets in the Keychain from
+// service usher.<old> to service usher.<new> (read → write → delete the old).
+//
+//	usher backend rename OLD NEW
+//
+// It refuses when OLD is absent or NEW already exists, and saves the config only
+// after the rename is applied in memory. A Keychain read that fails for one key
+// is a warning (the rename continues for the rest) rather than a hard abort, so
+// a single missing/locked item doesn't leave the config and the Keychain
+// permanently out of step.
+func backendRename(args []string) error {
+	if len(args) != 2 || args[0] == "" || args[1] == "" {
+		return fmt.Errorf("usage: usher backend rename OLD NEW")
+	}
+	oldName, newName := args[0], args[1]
+	if oldName == newName {
+		return fmt.Errorf("OLD and NEW are the same name %q; nothing to rename", oldName)
+	}
+
+	path := config.DefaultPath()
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// Locate OLD and guard NEW in one pass so we fail before mutating anything.
+	src := -1
+	for i := range cfg.Backends {
+		switch cfg.Backends[i].Name {
+		case oldName:
+			src = i
+		case newName:
+			return fmt.Errorf("backend %q already exists; choose a different NEW name", newName)
+		}
+	}
+	if src == -1 {
+		return fmt.Errorf("no backend named %q", oldName)
+	}
+
+	be := &cfg.Backends[src]
+
+	// Migrate Keychain secrets BEFORE renaming the config key, so each read still
+	// targets service usher.<old>. auth=env is the only strategy with secrets; all
+	// others migrate nothing. A failed read for one key is a warning (skip it and
+	// continue) so one bad item can't abort the whole rename.
+	var migrated []string
+	if be.Auth == "env" {
+		for _, k := range be.EnvKeys {
+			secret, err := keychainGet(oldName, k)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain read %s/%s failed, skipping migration of this key: %v\n", oldName, k, err)
+				continue
+			}
+			if err := keychainSet(newName, k, secret); err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain write %s/%s failed, skipping migration of this key: %v\n", newName, k, err)
+				continue
+			}
+			if err := keychainDelete(oldName, k); err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain delete %s/%s failed (secret copied to %s, stale item remains): %v\n", oldName, k, newName, err)
+			}
+			migrated = append(migrated, k)
+		}
+	}
+
+	// Apply the rename and persist. Save writes atomically via config.Save.
+	be.Name = newName
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+
+	fmt.Printf("renamed backend %q -> %q\n", oldName, newName)
+	for _, k := range migrated {
+		fmt.Printf("  migrated keychain secret %s: usher.%s -> usher.%s\n", k, oldName, newName)
+	}
 	return nil
 }
 
