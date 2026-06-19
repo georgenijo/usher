@@ -233,6 +233,21 @@ func (c *Config) Add(b Backend, makeDefault bool) {
 	c.Backends = append(c.Backends, b)
 }
 
+// Remove deletes the backend named name and reports whether one was found. It
+// only mutates the in-memory slice; the caller persists with Save and is
+// responsible for purging the backend's Keychain secrets (auth=env). A removed
+// default backend leaves the config with no default — ResolveBackend("") then
+// falls back to the first remaining backend.
+func (c *Config) Remove(name string) bool {
+	for i := range c.Backends {
+		if c.Backends[i].Name == name {
+			c.Backends = append(c.Backends[:i], c.Backends[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // keychainGet is the indirection used by EnvForBackend to read secrets. It is a
 // variable so tests can substitute an in-memory store without touching the real
 // Keychain; production always uses keychain.Get.

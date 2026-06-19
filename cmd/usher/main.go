@@ -95,6 +95,7 @@ usage:
   usher uninstall                   unload + remove the launchd LaunchAgent
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
+  usher backend remove NAME         deregister a backend (alias: rm; purges auth=env Keychain keys)
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher version
 
@@ -304,18 +305,85 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add|probe> ...")
+		return fmt.Errorf("usage: usher backend <list|add|remove|probe> ...")
 	}
 	switch args[0] {
 	case "list":
 		return backendList()
 	case "add":
 		return backendAdd(args[1:])
+	case "remove", "rm":
+		return backendRemove(args[1:])
 	case "probe":
 		return backendProbe(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|add|remove|probe)", args[0])
 	}
+}
+
+// keychainDelete is the indirection used by backendRemove to purge secrets. It
+// is a var so tests can substitute an in-memory store instead of shelling out to
+// the real Keychain; production always uses keychain.Delete.
+var keychainDelete = keychain.Delete
+
+// backendRemove deregisters the backend named in args[0] (alias `rm`). It loads
+// the config, removes the entry, and — for auth=env backends — purges each of
+// the backend's namespaced Keychain secrets (service usher.<name>, account = the
+// env-var name). It prints exactly what was removed. A missing backend is a
+// clear error before anything is touched.
+//
+// The --yes flag exists for scripting symmetry (and a future confirm prompt);
+// removal is non-interactive today, so it is accepted and ignored.
+func backendRemove(args []string) error {
+	fs := flag.NewFlagSet("backend remove", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip confirmation (no-op today; reserved for scripting)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	_ = *yes
+	rest := fs.Args()
+	if len(rest) != 1 || rest[0] == "" {
+		return fmt.Errorf("usage: usher backend remove [--yes] NAME")
+	}
+	name := rest[0]
+
+	path := config.DefaultPath()
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot the backend before removing it so we know its auth strategy and
+	// EnvKeys for the Keychain purge below; error clearly if it is absent.
+	be := cfg.ResolveBackend(name)
+	if be == nil {
+		return fmt.Errorf("no backend named %q (run: usher backend list)", name)
+	}
+	auth, envKeys := be.Auth, append([]string(nil), be.EnvKeys...)
+
+	if !cfg.Remove(name) {
+		// ResolveBackend already matched, so this should not happen; guard anyway.
+		return fmt.Errorf("no backend named %q", name)
+	}
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("removed backend %q from %s\n", name, path)
+
+	// Purge the backend's Keychain secrets only for auth=env. Keys are namespaced
+	// to the backend (service usher.<name>), so deleting them cannot touch another
+	// backend's secrets. keychain.Delete is idempotent — a missing item is fine —
+	// but a real Keychain error is surfaced (config is already saved, so this is
+	// reported, not rolled back).
+	if auth == "env" {
+		for _, k := range envKeys {
+			if err := keychainDelete(name, k); err != nil {
+				return fmt.Errorf("purge Keychain secret %s/%s: %w", name, k, err)
+			}
+			fmt.Printf("purged Keychain secret %s (service usher.%s)\n", k, name)
+		}
+	}
+	return nil
 }
 
 func backendList() error {
