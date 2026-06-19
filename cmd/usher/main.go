@@ -63,6 +63,8 @@ func main() {
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
 		err = cmdUninstall(os.Args[2:])
+	case "completion":
+		err = cmdCompletion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -96,6 +98,7 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher completion bash|zsh|fish    print a shell completion script to stdout
   usher version
 
 control-plane UI (served by serve --socket / start):
