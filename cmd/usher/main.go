@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -102,6 +103,7 @@ usage:
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
   usher config check                validate config.json (no daemon); exits non-zero on error
+  usher config init [--force]       scaffold a starter config.json (--force overwrites)
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -339,18 +341,19 @@ func cmdBackend(args []string) error {
 	}
 }
 
-// cmdConfig handles the config control subcommands. Today only `check` exists;
-// the dispatch mirrors cmdBackend so adding `config edit`/`config show` later is
-// a one-line case.
+// cmdConfig handles the config control subcommands. The dispatch mirrors
+// cmdBackend so adding `config edit`/`config show` later is a one-line case.
 func cmdConfig(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher config <check> ...")
+		return fmt.Errorf("usage: usher config <check|init> ...")
 	}
 	switch args[0] {
 	case "check":
 		return configCheck(args[1:])
+	case "init":
+		return configInit(args[1:])
 	default:
-		return fmt.Errorf("unknown config subcommand %q (want check)", args[0])
+		return fmt.Errorf("unknown config subcommand %q (want check|init)", args[0])
 	}
 }
 
@@ -376,6 +379,36 @@ func configCheck(args []string) error {
 		// adds for ordinary errors — the report already explains the failures.
 		os.Exit(1)
 	}
+	return nil
+}
+
+// configInit scaffolds a starter config.json at config.DefaultPath(). It refuses
+// to clobber an existing config unless --force is passed. The written JSON has no
+// comments (encoding/json can't emit them), so the next-steps hint goes to stderr
+// while the path written goes to stdout.
+func configInit(args []string) error {
+	fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite an existing config")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	path := config.DefaultPath()
+	if err := config.Init(path, *force); err != nil {
+		if errors.Is(err, config.ErrConfigExists) {
+			return fmt.Errorf("%w (pass --force to overwrite)", err)
+		}
+		return err
+	}
+
+	fmt.Println(path)
+	fmt.Fprintf(os.Stderr, `wrote starter config (empty backends list).
+
+next steps:
+  usher backend add NAME -- COMMAND...   register a backend
+  usher backend list                     show registered backends
+  usher serve --socket                   start the daemon
+`)
 	return nil
 }
 

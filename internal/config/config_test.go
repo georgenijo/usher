@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -57,6 +58,70 @@ func TestStateDirPaths(t *testing.T) {
 	if got, want := DefaultPath(), filepath.Join(dir, "config.json"); got != want {
 		t.Errorf("DefaultPath() = %q, want %q", got, want)
 	}
+}
+
+// TestInit covers `usher config init`'s on-disk behavior using a temp state dir:
+// it creates the state dir and writes a config that round-trips through Load, it
+// refuses to clobber an existing config without force, and --force overwrites.
+func TestInit(t *testing.T) {
+	t.Run("creates state dir and writes a loadable starter config", func(t *testing.T) {
+		// A nested, not-yet-created state dir proves Init makes the directory.
+		dir := filepath.Join(t.TempDir(), "fresh", ".usher")
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+
+		if err := Init(path, false); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("config not written: %v", err)
+		}
+
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load round-trip: %v", err)
+		}
+		if len(cfg.Backends) != 0 {
+			t.Errorf("starter Backends = %v, want empty", cfg.Backends)
+		}
+	})
+
+	t.Run("refuses an existing config without force", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+		if err := Init(path, false); err != nil {
+			t.Fatalf("first Init: %v", err)
+		}
+
+		err := Init(path, false)
+		if !errors.Is(err, ErrConfigExists) {
+			t.Fatalf("Init over existing = %v, want ErrConfigExists", err)
+		}
+	})
+
+	t.Run("force overwrites an existing config", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+
+		// Seed a non-starter config so we can prove --force replaced it.
+		seeded := &Config{Backends: []Backend{{Name: "old", Transport: "stdio", Auth: "inherit"}}}
+		if err := seeded.Save(path); err != nil {
+			t.Fatalf("seed Save: %v", err)
+		}
+
+		if err := Init(path, true); err != nil {
+			t.Fatalf("Init --force: %v", err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load after force: %v", err)
+		}
+		if len(cfg.Backends) != 0 {
+			t.Errorf("after --force Backends = %v, want empty (overwritten)", cfg.Backends)
+		}
+	})
 }
 
 // TestEnvForBackend covers the auth-strategy → env-additions mapping. The env

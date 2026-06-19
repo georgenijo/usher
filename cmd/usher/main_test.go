@@ -158,6 +158,37 @@ func TestBackendAddHandshakeProbe(t *testing.T) {
 	}
 }
 
+// TestConfigInit drives the `usher config init` command through its CLI entry
+// against an isolated state dir: a first init writes a loadable config, a second
+// without --force is refused, and --force overwrites.
+func TestConfigInit(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+	path := filepath.Join(dir, "config.json")
+
+	// First init writes a config that round-trips through the loader.
+	if err := configInit(nil); err != nil {
+		t.Fatalf("configInit(first) = %v, want nil", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load after init: %v", err)
+	}
+	if len(cfg.Backends) != 0 {
+		t.Errorf("scaffolded Backends = %v, want empty", cfg.Backends)
+	}
+
+	// Second init without --force must refuse.
+	if err := configInit(nil); err == nil {
+		t.Fatal("configInit(second, no --force) = nil, want refusal")
+	}
+
+	// --force overwrites without error.
+	if err := configInit([]string{"--force"}); err != nil {
+		t.Fatalf("configInit(--force) = %v, want nil", err)
+	}
+}
+
 // TestBackendAddValidation covers the flag/strategy reconciliation that rejects
 // bad invocations before any process is spawned or config written.
 func TestBackendAddValidation(t *testing.T) {
