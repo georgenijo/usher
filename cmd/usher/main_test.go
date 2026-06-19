@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -215,6 +216,98 @@ func TestBackendListMarksDisabled(t *testing.T) {
 	}
 	if strings.Contains(out, "cua (disabled)") {
 		t.Errorf("backend list wrongly marked enabled cua as disabled:\n%s", out)
+	}
+}
+
+// TestBackendRemoveRoundTrip drives add-then-remove against an isolated state
+// dir: a registered backend is removed and no longer resolves, while a sibling
+// backend is left untouched and the config file persists the change.
+func TestBackendRemoveRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+	path := filepath.Join(dir, "config.json")
+
+	okCmd := fakeBackendCommand(t, "ok")
+	if err := backendAdd(append([]string{"alpha", "--auth", "inherit", "--"}, okCmd...)); err != nil {
+		t.Fatalf("backendAdd(alpha) = %v", err)
+	}
+	if err := backendAdd(append([]string{"beta", "--auth", "inherit", "--"}, okCmd...)); err != nil {
+		t.Fatalf("backendAdd(beta) = %v", err)
+	}
+
+	if err := backendRemove([]string{"alpha"}); err != nil {
+		t.Fatalf("backendRemove(alpha) = %v, want nil", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if be := cfg.ResolveBackend("alpha"); be != nil {
+		t.Errorf("backend alpha still present after remove: %+v", be)
+	}
+	if be := cfg.ResolveBackend("beta"); be == nil {
+		t.Error("remove dropped the unrelated backend beta")
+	}
+}
+
+// TestBackendRemoveAbsent: removing a backend that was never registered is a
+// clear error and writes nothing.
+func TestBackendRemoveAbsent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	if err := backendRemove([]string{"ghost"}); err == nil {
+		t.Fatal("backendRemove(ghost) = nil, want error (absent backend)")
+	}
+	// No usage variants should write a config file.
+	if err := backendRemove([]string{}); err == nil {
+		t.Fatal("backendRemove() = nil, want usage error")
+	}
+}
+
+// TestBackendRemovePurgesEnvKeys: removing an auth=env backend purges each of
+// its namespaced Keychain secrets exactly once, via the keychainDelete
+// indirection (no real Keychain touched). The --yes flag is accepted.
+func TestBackendRemovePurgesEnvKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+	path := filepath.Join(dir, "config.json")
+
+	// Seed a config with an auth=env backend directly (skip the secret prompt
+	// that backendAdd would require).
+	cfg := &config.Config{Backends: []config.Backend{
+		{Name: "db", Transport: "stdio", Command: []string{"db-mcp"}, Auth: "env", EnvKeys: []string{"DB_USER", "DB_PASS"}},
+		{Name: "fs", Transport: "stdio", Command: []string{"fs-mcp"}, Auth: "none"},
+	}}
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var deleted []string
+	orig := keychainDelete
+	keychainDelete = func(backend, account string) error {
+		deleted = append(deleted, backend+"/"+account)
+		return nil
+	}
+	defer func() { keychainDelete = orig }()
+
+	if err := backendRemove([]string{"--yes", "db"}); err != nil {
+		t.Fatalf("backendRemove(--yes db) = %v, want nil", err)
+	}
+
+	want := []string{"db/DB_USER", "db/DB_PASS"}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Errorf("keychain deletes = %v, want %v", deleted, want)
+	}
+
+	// Removing the auth=none sibling must NOT touch the Keychain.
+	deleted = nil
+	if err := backendRemove([]string{"fs"}); err != nil {
+		t.Fatalf("backendRemove(fs) = %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Errorf("auth=none remove purged Keychain keys: %v", deleted)
 	}
 }
 

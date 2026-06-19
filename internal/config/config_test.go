@@ -190,6 +190,37 @@ func TestEnvForBackend(t *testing.T) {
 	}
 }
 
+// TestRemove: Remove deletes a backend by name and reports whether it found
+// one, leaving the other backends intact; removing an absent name is a no-op
+// that returns false.
+func TestRemove(t *testing.T) {
+	c := &Config{Backends: []Backend{
+		{Name: "cua", Transport: "stdio", Auth: "inherit", Default: true},
+		{Name: "db", Transport: "stdio", Auth: "env", EnvKeys: []string{"DB_KEY"}},
+		{Name: "fs", Transport: "stdio", Auth: "none"},
+	}}
+
+	if ok := c.Remove("nope"); ok {
+		t.Error("Remove(nope) = true, want false (absent backend)")
+	}
+	if len(c.Backends) != 3 {
+		t.Fatalf("Remove(nope) mutated config: have %d backends, want 3", len(c.Backends))
+	}
+
+	if ok := c.Remove("db"); !ok {
+		t.Fatal("Remove(db) = false, want true")
+	}
+	if c.ResolveBackend("db") != nil {
+		t.Error("backend db still resolvable after Remove")
+	}
+	if c.ResolveBackend("cua") == nil || c.ResolveBackend("fs") == nil {
+		t.Error("Remove(db) dropped an unrelated backend")
+	}
+	if len(c.Backends) != 2 {
+		t.Errorf("have %d backends after Remove(db), want 2", len(c.Backends))
+	}
+}
+
 // TestConfigRoundTrip: a backend carrying EnvKeys survives a Save/Load cycle and
 // EnvKeys is preserved, while no secret value is ever serialized (only names).
 func TestConfigRoundTrip(t *testing.T) {
