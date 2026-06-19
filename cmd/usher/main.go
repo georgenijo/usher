@@ -52,6 +52,8 @@ func main() {
 		err = mcpserver.Run(os.Stdin, os.Stdout)
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -99,6 +101,7 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher config check                validate config.json (no daemon); exits non-zero on error
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -334,6 +337,46 @@ func cmdBackend(args []string) error {
 	default:
 		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
 	}
+}
+
+// cmdConfig handles the config control subcommands. Today only `check` exists;
+// the dispatch mirrors cmdBackend so adding `config edit`/`config show` later is
+// a one-line case.
+func cmdConfig(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: usher config <check> ...")
+	}
+	switch args[0] {
+	case "check":
+		return configCheck(args[1:])
+	default:
+		return fmt.Errorf("unknown config subcommand %q (want check)", args[0])
+	}
+}
+
+// configCheck validates config.json without starting the daemon. The validation
+// logic lives in internal/config (CheckFile); this wiring stays thin: load,
+// print the report, and exit non-zero when there is any ERROR finding.
+func configCheck(args []string) error {
+	fs := flag.NewFlagSet("config check", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := config.DefaultPath()
+	res, err := config.CheckFile(path)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("checking %s\n", path)
+	var sb strings.Builder
+	res.Report(&sb)
+	fmt.Print(sb.String())
+	if res.HasError() {
+		// Surface a non-zero exit without the duplicate "usher: ..." prefix main
+		// adds for ordinary errors — the report already explains the failures.
+		os.Exit(1)
+	}
+	return nil
 }
 
 func backendList() error {
