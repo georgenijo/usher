@@ -411,6 +411,62 @@ func TestIndex_ServesUI(t *testing.T) {
 	}
 }
 
+// TestHealthz_ReturnsOK verifies GET /healthz answers a 200 with the probe
+// payload: status "ok", this process's pid, a non-negative uptime, and the
+// configured backend count (one fake backend). Connections start at zero.
+func TestHealthz_ReturnsOK(t *testing.T) {
+	srv, _, cleanup := testServer(t, []string{"click"})
+	defer cleanup()
+
+	rec := doReq(t, srv, "GET", "/healthz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("GET /healthz content-type = %q, want application/json", ct)
+	}
+	var h healthz
+	if err := json.Unmarshal(rec.Body.Bytes(), &h); err != nil {
+		t.Fatalf("decode healthz: %v (body=%s)", err, rec.Body.String())
+	}
+	if h.Status != "ok" {
+		t.Fatalf("status = %q, want ok", h.Status)
+	}
+	if h.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want this process %d", h.PID, os.Getpid())
+	}
+	if h.UptimeSeconds < 0 {
+		t.Fatalf("uptimeSeconds = %d, want >= 0", h.UptimeSeconds)
+	}
+	if h.Backends != 1 {
+		t.Fatalf("backends = %d, want 1 (the fake backend)", h.Backends)
+	}
+	if h.Connections != 0 {
+		t.Fatalf("connections = %d, want 0 (none opened)", h.Connections)
+	}
+}
+
+// TestHealthz_BareServer verifies /healthz answers a clean 200 with zero backends
+// when there is no supervisor behind it (a test server with no live daemon).
+func TestHealthz_BareServer(t *testing.T) {
+	srv := New(broker.NewHub(), nil, nil)
+
+	rec := doReq(t, srv, "GET", "/healthz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want 200", rec.Code)
+	}
+	var h healthz
+	if err := json.Unmarshal(rec.Body.Bytes(), &h); err != nil {
+		t.Fatalf("decode healthz: %v (body=%s)", err, rec.Body.String())
+	}
+	if h.Status != "ok" {
+		t.Fatalf("status = %q, want ok", h.Status)
+	}
+	if h.Backends != 0 {
+		t.Fatalf("backends = %d, want 0 (no supervisor)", h.Backends)
+	}
+}
+
 // waitFor polls cond up to ~2s, failing the test if it never holds. Used for the
 // event-driven registry, which updates asynchronously off the bus.
 func waitFor(t *testing.T, cond func() bool) {

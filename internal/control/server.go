@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -49,6 +50,10 @@ type Server struct {
 	// the handler never re-reads disk on the hot path. It carries no secrets (the
 	// config type already keeps secret VALUES out — only env var NAMES appear).
 	cfgSnapshot any
+
+	// startedAt is the server's construction time, used by GET /healthz to report
+	// uptime. It is captured once at New so the liveness probe stays a cheap read.
+	startedAt time.Time
 }
 
 // New builds a control server over the broker's event bus and shared backend
@@ -66,6 +71,7 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 		res:         newResourceState(),
 		mux:         http.NewServeMux(),
 		cfgSnapshot: cfgSnapshot,
+		startedAt:   time.Now(),
 	}
 	s.routes()
 	return s
@@ -76,6 +82,7 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 // routing needs no third-party router.
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleIndex)
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/backends", s.handleBackends)
 	s.mux.HandleFunc("GET /api/connections", s.handleConnections)
 	s.mux.HandleFunc("GET /api/resources", s.handleResources)
@@ -182,6 +189,38 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		cfg = struct{}{}
 	}
 	writeJSON(w, http.StatusOK, cfg)
+}
+
+// healthz is the JSON body GET /healthz returns: a fixed "ok" status plus a few
+// cheap, already-available liveness counters — the daemon pid, seconds since the
+// control server was constructed, and the count of configured backends and live
+// agent connections. It is a probe payload, never authoritative state; the rich
+// listings live behind /api/backends and /api/connections.
+type healthz struct {
+	Status        string `json:"status"`
+	PID           int    `json:"pid"`
+	UptimeSeconds int64  `json:"uptimeSeconds"`
+	Backends      int    `json:"backends"`
+	Connections   int    `json:"connections"`
+}
+
+// handleHealthz answers GET /healthz with a 200 and the healthz probe payload. It
+// touches only counters already on hand — the supervisor's backend count and the
+// connection registry's live size — so it stays a cheap liveness check that never
+// blocks on the broker or re-reads disk. A nil supervisor reports zero backends so
+// a bare server (no daemon behind it) still answers a clean 200.
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	backends := 0
+	if s.sv != nil {
+		backends = len(s.sv.Snapshot())
+	}
+	writeJSON(w, http.StatusOK, healthz{
+		Status:        "ok",
+		PID:           os.Getpid(),
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		Backends:      backends,
+		Connections:   len(s.reg.snapshot()),
+	})
 }
 
 // manage builds a POST handler for a lifecycle action (Start/Stop/Restart),
