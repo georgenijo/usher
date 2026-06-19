@@ -72,6 +72,21 @@ type Config struct {
 	// over the socket but never binds the HTTP listener. The --ui-off flag forces
 	// this for a single run; this is the persistent default.
 	UIOff bool `json:"uiOff,omitempty"`
+
+	// AuditLogPath overrides where the broker's rotating audit log lives. Empty
+	// (the unset default) means StateDir()/audit.log, so zero-config still gets a
+	// durable on-disk copy alongside the stderr stream.
+	AuditLogPath string `json:"auditLogPath,omitempty"`
+
+	// AuditMaxBytes is the size (in bytes) the active audit log may reach before
+	// the sink rotates it. Zero (unset) means use the audit package's built-in
+	// default (audit.DefaultMaxBytes).
+	AuditMaxBytes int64 `json:"auditMaxBytes,omitempty"`
+
+	// AuditKeep is how many rotated audit files (audit.log.1 .. audit.log.K) the
+	// sink retains before pruning the oldest. Zero (unset) means use the audit
+	// package's built-in default (audit.DefaultKeep).
+	AuditKeep int `json:"auditKeep,omitempty"`
 }
 
 // EnvAllowTools is the environment variable that allow-lists destructive tools
@@ -132,6 +147,20 @@ func SocketPath() string { return filepath.Join(StateDir(), "usher.sock") }
 // a process-liveness check is how `usher status` distinguishes running from
 // stopped from stale, without a flock dependency.
 func PidPath() string { return filepath.Join(StateDir(), "usher.pid") }
+
+// DefaultAuditLogPath is the rotating audit log location inside the state dir,
+// used when AuditLogPath is unset.
+func DefaultAuditLogPath() string { return filepath.Join(StateDir(), "audit.log") }
+
+// AuditPath resolves the audit log location: the AuditLogPath override when set,
+// otherwise DefaultAuditLogPath. A relative override is taken as-is (resolved
+// against the process cwd) so an operator can point it anywhere.
+func (c *Config) AuditPath() string {
+	if c.AuditLogPath != "" {
+		return c.AuditLogPath
+	}
+	return DefaultAuditLogPath()
+}
 
 // UIURLPath is the file the daemon writes with the dashboard URL it actually
 // bound, so `usher status` and `usher ui` (separate processes that cannot see

@@ -1,6 +1,7 @@
 // Package audit is the broker's append-only record of every message crossing
-// the front desk. The skeleton logs to a writer (stderr by default); a later
-// phase points it at a file under the state dir and adds structured records.
+// the front desk. It logs to a writer; the broker drives it with an
+// io.MultiWriter over stderr AND a size-rotated file under the state dir (see
+// FileSink in file.go). Structured records remain a later phase.
 package audit
 
 import (
