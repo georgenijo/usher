@@ -27,6 +27,28 @@ func newTestBroker(t *testing.T) *Broker {
 	return b
 }
 
+// TestNewWithLevel asserts the verbosity flag threads from the constructor into
+// the broker's audit logger: New keeps the historical default (normal), while
+// NewWithLevel(LevelQuiet) gives the daemon a quiet logger. The gating itself is
+// covered in the audit package; here we only verify the wiring (#log-verbosity).
+func TestNewWithLevel(t *testing.T) {
+	if b, err := New(&config.Config{}); err != nil {
+		t.Fatal(err)
+	} else if got := b.audit.Level(); got != audit.LevelNormal {
+		t.Errorf("New level = %v, want LevelNormal", got)
+	}
+
+	for _, lvl := range []audit.Level{audit.LevelQuiet, audit.LevelNormal, audit.LevelVerbose} {
+		b, err := NewWithLevel(&config.Config{}, lvl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := b.audit.Level(); got != lvl {
+			t.Errorf("NewWithLevel(%v) audit level = %v", lvl, got)
+		}
+	}
+}
+
 // TestBroker_InboundRecordOutboundTrim drives both pumps over in-memory pipes,
 // sharing one inflight map exactly as ServeStdio does: the inbound pump records
 // the tools/call request, the outbound pump's TrimStage consumes it and trims

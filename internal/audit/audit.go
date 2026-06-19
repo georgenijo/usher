@@ -11,16 +11,46 @@ import (
 	"github.com/georgenijo/usher/internal/identity"
 )
 
+// Level controls the stderr verbosity of the Logger. It gates ONLY the
+// informational Infof lifecycle lines; errors, gate-blocked/security lines, and
+// the core per-message audit record always emit regardless of level so a quiet
+// daemon never hides a refusal or a transport failure (#log-verbosity).
+type Level int
+
+const (
+	// LevelQuiet suppresses Infof lifecycle lines (prewarm, backend state
+	// transitions, sampler start/stop) while keeping errors and the core audit.
+	LevelQuiet Level = iota
+	// LevelNormal is the default: every line emits, the historical behavior.
+	LevelNormal
+	// LevelVerbose is the full-detail level. It currently emits exactly what
+	// LevelNormal does (the format is fixed by spec); it exists so a future
+	// debug-only line can gate on it without another signature change.
+	LevelVerbose
+)
+
 // Logger formats audit lines. It is safe for concurrent use via the embedded
 // *log.Logger.
 type Logger struct {
-	l *log.Logger
+	l     *log.Logger
+	level Level
 }
 
-// New returns a Logger writing to w.
+// New returns a Logger writing to w at the default (normal) verbosity — the
+// historical behavior where every line emits.
 func New(w io.Writer) *Logger {
-	return &Logger{l: log.New(w, "usher ", log.LstdFlags|log.Lmicroseconds)}
+	return NewLevel(w, LevelNormal)
 }
+
+// NewLevel returns a Logger writing to w at the given verbosity. Only Infof is
+// gated by level; Errorf, the core Message audit, and connect/disconnect lines
+// always emit.
+func NewLevel(w io.Writer, level Level) *Logger {
+	return &Logger{l: log.New(w, "usher ", log.LstdFlags|log.Lmicroseconds), level: level}
+}
+
+// Level reports the Logger's configured verbosity.
+func (a *Logger) Level() Level { return a.level }
 
 // Connect records a new agent connection bound to a backend.
 func (a *Logger) Connect(id identity.Identity, backend string) {
@@ -62,6 +92,13 @@ func (a *Logger) Errorf(id, format string, args ...any) {
 // healthy stopped→starting→live no longer reads as an "error" on the daemon's
 // stderr. tag is a subsystem label ("supervisor", "loadtest", "procstat")
 // rather than a connection id.
+//
+// Infof is the ONLY level-gated line: at LevelQuiet it is suppressed so a quiet
+// daemon's stderr carries only errors, gate-blocked/security lines, and the core
+// per-message audit. Errorf and Message are never gated.
 func (a *Logger) Infof(tag, format string, args ...any) {
+	if a.level < LevelNormal {
+		return
+	}
 	a.l.Printf("info tag=%s "+format, append([]any{tag}, args...)...)
 }
