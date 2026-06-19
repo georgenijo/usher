@@ -125,8 +125,6 @@ func TestEnvForBackend(t *testing.T) {
 	}
 }
 
-// TestConfigRoundTrip: a backend carrying EnvKeys survives a Save/Load cycle and
-// EnvKeys is preserved, while no secret value is ever serialized (only names).
 // TestRemove: Remove deletes a backend by name and reports whether it found
 // one, leaving the other backends intact; removing an absent name is a no-op
 // that returns false.
@@ -158,6 +156,8 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+// TestConfigRoundTrip: a backend carrying EnvKeys survives a Save/Load cycle and
+// EnvKeys is preserved, while no secret value is ever serialized (only names).
 func TestConfigRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
