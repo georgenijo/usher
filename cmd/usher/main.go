@@ -96,6 +96,8 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher backend export [--out FILE] write all backends as JSON (no secrets) to stdout/FILE
+  usher backend import [--force] F  add backends from JSON F (handshake-validated; --force overwrites)
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -304,7 +306,7 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add|probe> ...")
+		return fmt.Errorf("usage: usher backend <list|add|probe|export|import> ...")
 	}
 	switch args[0] {
 	case "list":
@@ -313,8 +315,12 @@ func cmdBackend(args []string) error {
 		return backendAdd(args[1:])
 	case "probe":
 		return backendProbe(args[1:])
+	case "export":
+		return backendExport(args[1:])
+	case "import":
+		return backendImport(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe|export|import)", args[0])
 	}
 }
 
@@ -442,42 +448,57 @@ func backendAdd(args []string) error {
 		Auth:      *auth,
 		EnvKeys:   []string(envKeys),
 	}
-	cfg.Add(be, *makeDefault)
 
-	// Handshake-validate-BEFORE-save: the done criterion is "refuse to register
-	// if the handshake fails (with a clear message)." So we probe first and only
-	// persist a backend that actually speaks MCP — a handshake failure is fatal
-	// and the config is left untouched.
-	//
-	// The lone advisory exception is when the auth env cannot be resolved yet
-	// (e.g. a key not yet in the Keychain, an OAuth flow still pending). That is a
-	// legitimately pre-install state, not a broken backend, so we register
-	// without probing and tell the user how to verify later. We resolve against a
-	// transient copy that is added to cfg but NOT yet saved.
-	probeBe := cfg.ResolveBackend(name)
+	skipped, err := validateAndSaveBackend(cfg, path, be, *makeDefault)
+	if err != nil {
+		return fmt.Errorf("backend %q handshake failed, not registered: %w\n  (fix the command/key, then re-run: usher backend add %s ...)", name, err, name)
+	}
+	if skipped {
+		return nil // advisory already printed
+	}
+	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
+	return nil
+}
+
+// validateAndSaveBackend is the canonical handshake-validate-BEFORE-save gate
+// shared by `backend add` and `backend import`. It adds be to cfg, probes the
+// MCP handshake, and only persists cfg to path on success — a handshake failure
+// is fatal and leaves the on-disk config untouched (the caller wraps the error
+// with a command-specific hint).
+//
+// The lone advisory exception is when the auth env cannot be resolved yet (e.g.
+// a key not yet in the Keychain, an OAuth flow still pending). That is a
+// legitimately pre-install state, not a broken backend, so we register without
+// probing, print a verify-later hint, and report skipped=true so the caller
+// suppresses its own success line.
+func validateAndSaveBackend(cfg *config.Config, path string, be config.Backend, makeDefault bool) (skipped bool, err error) {
+	cfg.Add(be, makeDefault)
+
+	// Resolve auth env against a transient copy that is added to cfg but NOT yet
+	// saved.
+	probeBe := cfg.ResolveBackend(be.Name)
 	envExtra, err := config.EnvForBackend(probeBe)
 	if err != nil {
 		// Auth env not yet resolvable: register without probing (advisory).
-		if err := cfg.Save(path); err != nil {
-			return err
+		if serr := cfg.Save(path); serr != nil {
+			return false, serr
 		}
 		fmt.Fprintf(os.Stderr, "usher: warning: cannot resolve auth env: %v\n", err)
-		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", name, name)
-		return nil
+		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", be.Name, be.Name)
+		return true, nil
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := probeBackend(probeCtx, probeBe, envExtra); err != nil {
 		// Handshake failed: refuse to register and leave config untouched.
-		return fmt.Errorf("backend %q handshake failed, not registered: %w\n  (fix the command/key, then re-run: usher backend add %s ...)", name, err, name)
+		return false, err
 	}
 
 	// Handshake ok — now persist.
 	if err := cfg.Save(path); err != nil {
-		return err
+		return false, err
 	}
-	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
-	return nil
+	return false, nil
 }
 
 // backendProbe re-runs the initialize handshake against an already-registered
@@ -508,6 +529,123 @@ func backendProbe(args []string) error {
 		return fmt.Errorf("backend %q handshake failed: %w", name, err)
 	}
 	fmt.Printf("backend %q handshake: ok\n", name)
+	return nil
+}
+
+// backendExport writes every registered backend as a JSON array to stdout (or to
+// --out FILE). Each entry carries name, transport, auth, command/args, and the
+// env key NAMES — the same fields that live in config.json. Secret VALUES are
+// never exported: they live exclusively in the Keychain (config.Backend has no
+// field for them), so the marshaled portable record cannot leak a secret.
+func backendExport(args []string) error {
+	fs := flag.NewFlagSet("backend export", flag.ContinueOnError)
+	out := fs.String("out", "", "write to FILE instead of stdout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+
+	// Marshal config.Backend records: they have no secret field, so name/transport/
+	// auth/command/envKeys (names only) are exactly what gets written. Default is
+	// intentionally cleared — "default" is a property of one machine's setup, not a
+	// portable attribute of the backend; import never sets a default either.
+	backends := make([]config.Backend, len(cfg.Backends))
+	copy(backends, cfg.Backends)
+	for i := range backends {
+		backends[i].Default = false
+	}
+	b, err := json.MarshalIndent(backends, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+
+	if *out == "" {
+		_, err := os.Stdout.Write(b)
+		return err
+	}
+	if err := os.WriteFile(*out, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "usher: exported %d backend(s) to %s\n", len(backends), *out)
+	return nil
+}
+
+// backendImport reads a JSON array produced by `backend export` and registers
+// each backend, HANDSHAKE-VALIDATING before saving (the same gate as
+// `backend add` — a backend that does not speak MCP is refused). On a name
+// collision with an already-registered backend it skips the entry unless
+// --force is set. The import is incremental: each backend that passes its
+// handshake is persisted, so a later failure does not roll back earlier ones,
+// and the failing backend is left out of config.json.
+func backendImport(args []string) error {
+	fs := flag.NewFlagSet("backend import", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite a backend whose name already exists")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 || rest[0] == "" {
+		return fmt.Errorf("usage: usher backend import [--force] FILE")
+	}
+	file := rest[0]
+
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	var incoming []config.Backend
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return fmt.Errorf("parse %s: %w (expected a JSON array from `usher backend export`)", file, err)
+	}
+
+	path := config.DefaultPath()
+	var imported, skipped, failed int
+	for _, be := range incoming {
+		if be.Name == "" {
+			return fmt.Errorf("import: entry with empty name in %s", file)
+		}
+
+		// Reload per entry so each successful import is observed by the next
+		// collision check and the on-disk config grows incrementally.
+		cfg, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		if existing := cfg.ResolveBackend(be.Name); existing != nil && !*force {
+			fmt.Fprintf(os.Stderr, "usher: skipping %q: a backend with that name already exists (use --force to overwrite)\n", be.Name)
+			skipped++
+			continue
+		}
+
+		// Default is never imported — it is a per-machine property; importing must
+		// not silently steal the default away from an existing backend.
+		be.Default = false
+		// Handshake-validate before saving (reuses the add gate); never makeDefault.
+		advisory, verr := validateAndSaveBackend(cfg, path, be, false)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "usher: skipping %q: handshake failed: %v\n", be.Name, verr)
+			failed++
+			continue
+		}
+		if advisory {
+			// Registered but probe skipped (auth env not yet resolvable); the helper
+			// already printed the verify-later hint.
+			imported++
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "usher: imported %q (handshake: ok)\n", be.Name)
+		imported++
+	}
+
+	fmt.Fprintf(os.Stderr, "usher: import complete: %d imported, %d skipped, %d failed\n", imported, skipped, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d backend(s) failed to import", failed)
+	}
 	return nil
 }
 

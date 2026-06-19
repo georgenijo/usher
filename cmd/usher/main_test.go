@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,6 +157,192 @@ func TestBackendAddHandshakeProbe(t *testing.T) {
 	}
 	if bad := cfg.ResolveBackend("bad"); bad != nil {
 		t.Errorf("backend \"bad\" was persisted despite a failed handshake: %+v", bad)
+	}
+}
+
+// TestBackendExportImportRoundTrip exports a fleet from one state dir and imports
+// it into a fresh, empty state dir, proving the portable JSON round-trips a
+// backend's name/transport/auth/command/env-key-NAMES and that import
+// handshake-validates each entry before persisting it.
+func TestBackendExportImportRoundTrip(t *testing.T) {
+	// Source machine: register two valid MCP backends.
+	srcDir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", srcDir)
+	okCmd := fakeBackendCommand(t, "ok")
+	if err := backendAdd(append([]string{"alpha", "--auth", "inherit", "--"}, okCmd...)); err != nil {
+		t.Fatalf("backendAdd(alpha) = %v", err)
+	}
+	if err := backendAdd(append([]string{"beta", "--auth", "inherit", "--"}, okCmd...)); err != nil {
+		t.Fatalf("backendAdd(beta) = %v", err)
+	}
+
+	// Export to a file. (--out keeps stdout clean and gives us bytes to import.)
+	exportFile := filepath.Join(t.TempDir(), "backends.json")
+	if err := backendExport([]string{"--out", exportFile}); err != nil {
+		t.Fatalf("backendExport = %v", err)
+	}
+
+	// Sanity: the export is a JSON array carrying both backends and NO secret
+	// fields (config.Backend has none, so this is structural — assert anyway).
+	exported, err := os.ReadFile(exportFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dump []config.Backend
+	if err := json.Unmarshal(exported, &dump); err != nil {
+		t.Fatalf("export is not a JSON array of backends: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, be := range dump {
+		seen[be.Name] = true
+	}
+	if !seen["alpha"] || !seen["beta"] {
+		t.Fatalf("export missing added backends; got %v", seen)
+	}
+
+	// Destination machine: a fresh, empty state dir.
+	dstDir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dstDir)
+	if err := backendImport([]string{exportFile}); err != nil {
+		t.Fatalf("backendImport = %v", err)
+	}
+
+	cfg, err := config.Load(filepath.Join(dstDir, "config.json"))
+	if err != nil {
+		t.Fatalf("Load(dst): %v", err)
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		be := cfg.ResolveBackend(name)
+		if be == nil {
+			t.Fatalf("backend %q not imported", name)
+		}
+		if be.Transport != "stdio" || be.Auth != "inherit" {
+			t.Errorf("backend %q round-trip mismatch: %+v", name, be)
+		}
+		if len(be.Command) == 0 {
+			t.Errorf("backend %q lost its command on round-trip", name)
+		}
+	}
+}
+
+// TestBackendImportRejectsInvalid proves import refuses a backend that cannot
+// speak MCP: the bad entry is handshake-validated, fails, and is NOT persisted,
+// while a valid sibling entry in the same file still imports.
+func TestBackendImportRejectsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	okCmd := fakeBackendCommand(t, "ok")
+	manifest := []config.Backend{
+		{Name: "good", Transport: "stdio", Auth: "inherit", Command: okCmd},
+		// `/usr/bin/false` exits immediately and speaks no MCP: handshake must fail.
+		{Name: "bad", Transport: "stdio", Auth: "inherit", Command: []string{"/usr/bin/false"}},
+	}
+	file := filepath.Join(t.TempDir(), "manifest.json")
+	b, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(file, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Import returns a non-nil error because one entry failed its handshake.
+	if err := backendImport([]string{file}); err == nil {
+		t.Fatal("backendImport = nil, want error (an invalid backend must fail import)")
+	}
+
+	cfg, err := config.Load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ResolveBackend("good") == nil {
+		t.Error("valid backend \"good\" was not imported despite passing its handshake")
+	}
+	if bad := cfg.ResolveBackend("bad"); bad != nil {
+		t.Errorf("invalid backend \"bad\" was persisted despite a failed handshake: %+v", bad)
+	}
+}
+
+// TestBackendImportCollision proves a name that already exists is skipped by
+// default and only overwritten with --force.
+func TestBackendImportCollision(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	okCmd := fakeBackendCommand(t, "ok")
+	// Pre-register a backend that the manifest will also name.
+	if err := backendAdd(append([]string{"dup", "--auth", "inherit", "--"}, okCmd...)); err != nil {
+		t.Fatalf("backendAdd(dup) = %v", err)
+	}
+
+	// Manifest names "dup" with a DIFFERENT command so we can detect an overwrite.
+	manifest := []config.Backend{
+		{Name: "dup", Transport: "stdio", Auth: "inherit", Command: []string{"/bin/sh", "-c", "overwritten"}},
+	}
+	file := filepath.Join(t.TempDir(), "manifest.json")
+	b, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(file, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	overwritten := []string{"/bin/sh", "-c", "overwritten"}
+
+	// Without --force: collision is skipped, original command preserved, no error.
+	if err := backendImport([]string{file}); err != nil {
+		t.Fatalf("backendImport (no force) = %v, want nil (collision is skipped, not fatal)", err)
+	}
+	cfg, _ := config.Load(filepath.Join(dir, "config.json"))
+	if be := cfg.ResolveBackend("dup"); be == nil || reflect.DeepEqual(be.Command, overwritten) {
+		t.Errorf("dup was overwritten without --force: %+v", be)
+	}
+
+	// With --force: the manifest entry replaces the existing backend. The
+	// overwriting command speaks no MCP, so the handshake fails and import returns
+	// an error — but that proves --force REACHED the validate step (vs skipping).
+	if err := backendImport([]string{"--force", file}); err == nil {
+		t.Fatal("backendImport (--force) = nil, want error (overwrite command speaks no MCP)")
+	}
+	// The failed handshake means the bad overwrite was NOT persisted; the original
+	// good backend remains untouched.
+	cfg, _ = config.Load(filepath.Join(dir, "config.json"))
+	if be := cfg.ResolveBackend("dup"); be == nil || reflect.DeepEqual(be.Command, overwritten) {
+		t.Errorf("--force persisted a backend whose handshake failed: %+v", be)
+	}
+}
+
+// TestBackendExportNoSecrets proves the export carries only env key NAMES, never
+// secret values — config.Backend has no secret field, so a marshaled export
+// cannot contain a value even for an auth=env backend.
+func TestBackendExportNoSecrets(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USHER_STATE_DIR", dir)
+
+	// Write a config with a single auth=env backend directly (avoids the Keychain
+	// prompt that `backend add --auth env` would trigger, and the seeded default).
+	cfg := &config.Config{Backends: []config.Backend{{
+		Name:      "envbacked",
+		Transport: "stdio",
+		Auth:      "env",
+		Command:   []string{"cmd"},
+		EnvKeys:   []string{"ANTHROPIC_API_KEY"},
+	}}}
+	if err := cfg.Save(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	exportFile := filepath.Join(t.TempDir(), "out.json")
+	if err := backendExport([]string{"--out", exportFile}); err != nil {
+		t.Fatalf("backendExport = %v", err)
+	}
+	out, err := os.ReadFile(exportFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "ANTHROPIC_API_KEY") {
+		t.Error("export dropped the env key NAME, which must be portable")
+	}
+	// The env key VALUE lives only in the Keychain; config.Backend has no field for
+	// it, so a KEY=VALUE pair can never appear in the export.
+	if strings.Contains(string(out), "=") {
+		t.Errorf("export appears to contain a secret value: %s", out)
 	}
 }
 
