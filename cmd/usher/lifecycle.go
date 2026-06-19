@@ -7,6 +7,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -206,13 +207,34 @@ func cmdStop(args []string) error {
 	return nil
 }
 
+// statusJSON is the machine-readable shape of `usher status --json`. It mirrors
+// exactly what the human line reports: the state string (stopped|running|stale),
+// the pid and socket path, and the UI URL ("off" when none). Pid is omitted when
+// there is no pid file (stopped) so consumers don't read a meaningless 0.
+type statusJSON struct {
+	State  string `json:"state"`            // stopped|running|stale
+	PID    int    `json:"pid,omitempty"`    // present for running|stale
+	Socket string `json:"socket,omitempty"` // present for running
+	UI     string `json:"ui,omitempty"`     // bound URL or "off" (running only)
+}
+
 // cmdStatus prints the daemon's state from the PID file and a liveness check:
 // stopped (no file), running (file + live process), or a stale pid file (file
 // present but the process is gone) so the operator knows to run `usher stop`.
+// With --json it emits the same facts as a single JSON object for tooling.
 func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "emit daemon status as a JSON object instead of a line")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	pid, err := readPID(config.PidPath())
 	if err != nil {
 		if os.IsNotExist(err) {
+			if *asJSON {
+				return emitStatusJSON(statusJSON{State: "stopped"})
+			}
 			fmt.Println("usher: stopped")
 			return nil
 		}
@@ -229,11 +251,24 @@ func cmdStatus(args []string) error {
 				ui = s
 			}
 		}
+		if *asJSON {
+			return emitStatusJSON(statusJSON{State: "running", PID: pid, Socket: config.SocketPath(), UI: ui})
+		}
 		fmt.Printf("usher: running pid=%d socket=%s ui=%s\n", pid, config.SocketPath(), ui)
 		return nil
 	}
+	if *asJSON {
+		return emitStatusJSON(statusJSON{State: "stale", PID: pid})
+	}
 	fmt.Printf("usher: stale pid file (pid=%d not running); run: usher stop\n", pid)
 	return nil
+}
+
+// emitStatusJSON writes one indented status object to stdout.
+func emitStatusJSON(s statusJSON) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(s)
 }
 
 // cmdInstall writes the launchd LaunchAgent plist and loads it so macOS starts
