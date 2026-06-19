@@ -262,6 +262,9 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 	if be == nil {
 		return fmt.Errorf("no backend configured (run: usher backend add <name> -- <command...>)")
 	}
+	if be.Disabled {
+		return fmt.Errorf("backend %q is disabled (enable it before serving)", be.Name)
+	}
 	if be.Transport != "stdio" {
 		return fmt.Errorf("backend %q: transport %q not supported yet", be.Name, be.Transport)
 	}

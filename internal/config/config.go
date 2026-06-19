@@ -29,6 +29,13 @@ type Backend struct {
 	EnvKeys []string `json:"envKeys,omitempty"`
 
 	Default bool `json:"default,omitempty"`
+
+	// Disabled, when true, removes the backend from multi-backend enumeration
+	// ("usher serve --all") so it is never spawned, while leaving it registered.
+	// This is SELECTION metadata only — it does not touch the pipeline or message
+	// handling. omitempty keeps existing configs (and false here) byte-for-byte
+	// unchanged on disk.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // Config is the whole usher state file.

@@ -189,6 +189,12 @@ func (b *Broker) resolveBackends(names []string) ([]*config.Backend, error) {
 	if len(names) == 0 {
 		for i := range b.cfg.Backends {
 			be := &b.cfg.Backends[i]
+			// A disabled backend is silently skipped from the --all enumeration: it
+			// stays registered but is never spawned. (An EXPLICITLY named disabled
+			// backend below errors instead, so the operator gets a clear signal.)
+			if be.Disabled {
+				continue
+			}
 			if be.Transport != "stdio" {
 				return nil, fmt.Errorf("backend %q: transport %q not supported yet", be.Name, be.Transport)
 			}
@@ -203,6 +209,9 @@ func (b *Broker) resolveBackends(names []string) ([]*config.Backend, error) {
 		be := b.cfg.ResolveBackend(name)
 		if be == nil {
 			return nil, fmt.Errorf("no backend named %q (run: usher backend list)", name)
+		}
+		if be.Disabled {
+			return nil, fmt.Errorf("backend %q is disabled (enable it before serving)", be.Name)
 		}
 		if be.Transport != "stdio" {
 			return nil, fmt.Errorf("backend %q: transport %q not supported yet", be.Name, be.Transport)
