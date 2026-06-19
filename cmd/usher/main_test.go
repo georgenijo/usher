@@ -31,6 +31,9 @@ func TestMain(m *testing.M) {
 //	noresult      answer initialize with an empty result (probe fails: not MCP)
 //	error         answer initialize with a JSON-RPC error (probe fails)
 //	silent        read but never reply (probe fails on the context deadline)
+//	chatty        like "ok" but emits notifications/tools/list_changed before each
+//	              reply (server-everything's behaviour) — the prober must skip the
+//	              notification and still find the matching response
 //
 // A child with no recognized mode falls through to "ok".
 func fakeBackendMain() {
@@ -40,6 +43,12 @@ func fakeBackendMain() {
 		msg, err := conn.Read()
 		if err != nil {
 			return // EOF / half-close
+		}
+		// A chatty backend slips a server-initiated notification in ahead of each
+		// of its responses. A prober that grabs the first message would mistake it
+		// for the response (regression guard for commit 7524818).
+		if mode == "chatty" && (msg.Method == "initialize" || msg.Method == "tools/list") {
+			_ = conn.Write(&mcp.Message{JSONRPC: "2.0", Method: "notifications/tools/list_changed"})
 		}
 		if msg.Method == "tools/list" {
 			// doctor counts these; a well-behaved "ok" backend advertises two
@@ -151,6 +160,25 @@ func TestProbeBackendDetail(t *testing.T) {
 	}
 	if res.Tools != 2 {
 		t.Errorf("tools = %d, want 2", res.Tools)
+	}
+}
+
+// TestProbeBackendDetailChatty guards the commit-7524818 regression: a backend
+// that emits a server-initiated notification (notifications/tools/list_changed)
+// before each reply must not have that notification mistaken for the initialize
+// or tools/list response. The probe must skip past it, succeed, and still count
+// the two advertised tools.
+func TestProbeBackendDetailChatty(t *testing.T) {
+	be := &config.Backend{Name: "fake", Transport: "stdio", Command: fakeBackendCommand(t, "chatty"), Auth: "inherit"}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	res, err := probeBackendDetail(ctx, be, nil)
+	if err != nil {
+		t.Fatalf("probeBackendDetail(chatty) = %v, want nil", err)
+	}
+	if res.Tools != 2 {
+		t.Errorf("tools = %d, want 2 (notification must be skipped, not counted as response)", res.Tools)
 	}
 }
 

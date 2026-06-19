@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -636,21 +637,48 @@ func probeBackendDetail(ctx context.Context, be *config.Backend, envExtra []stri
 	// Read responses on a goroutine so a backend that never replies is bounded by
 	// the context deadline rather than blocking Read forever. One reader serves
 	// the whole probe sequence (initialize, then tools/list).
+	//
+	// read skips server-initiated traffic and returns only the response whose id
+	// matches wantID. A backend may emit a notification (server-everything sends
+	// notifications/tools/list_changed right after initialize) or a server→client
+	// request before answering ours; a naive single Read would mistake one of
+	// those for the response — reporting "not an MCP server" or 0 tools (the bug
+	// fixed for the broker handshake in commit 7524818). The whole loop, including
+	// each Read, stays bounded by the context deadline.
 	type readResult struct {
 		m   *mcp.Message
 		err error
 	}
-	read := func() (*mcp.Message, error) {
-		ch := make(chan readResult, 1)
-		go func() {
-			m, err := conn.Read()
-			ch <- readResult{m, err}
-		}()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case r := <-ch:
-			return r.m, r.err
+	read := func(wantID json.RawMessage) (*mcp.Message, error) {
+		for {
+			ch := make(chan readResult, 1)
+			go func() {
+				m, err := conn.Read()
+				ch <- readResult{m, err}
+			}()
+			var r readResult
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case r = <-ch:
+			}
+			if r.err != nil {
+				return nil, r.err
+			}
+			// Skip server-initiated traffic: notifications (no id) and server
+			// requests (method + id) are not our response. A reply carries no
+			// method and an id; one bearing our id is the answer (even an empty
+			// result, so the "not an MCP server" check below still fires fast).
+			if r.m.Method != "" {
+				continue
+			}
+			if len(r.m.ID) == 0 {
+				continue
+			}
+			if bytes.Equal(bytes.TrimSpace(r.m.ID), bytes.TrimSpace(wantID)) {
+				return r.m, nil
+			}
+			// A response with a different id (out-of-order) — keep waiting.
 		}
 	}
 
@@ -666,7 +694,7 @@ func probeBackendDetail(ctx context.Context, be *config.Backend, envExtra []stri
 		return res, fmt.Errorf("write initialize: %w", err)
 	}
 
-	m, err := read()
+	m, err := read(req.ID)
 	if err != nil {
 		if ctx.Err() != nil {
 			return res, fmt.Errorf("initialize: %w", ctx.Err())
@@ -697,7 +725,7 @@ func probeBackendDetail(ctx context.Context, be *config.Backend, envExtra []stri
 	if err := conn.Write(listReq); err != nil {
 		return res, nil // handshake already proved MCP; report what we have
 	}
-	lm, err := read()
+	lm, err := read(listReq.ID)
 	if err != nil || lm == nil || len(lm.Error) > 0 || len(lm.Result) == 0 {
 		return res, nil
 	}
