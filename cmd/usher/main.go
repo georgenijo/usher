@@ -51,6 +51,8 @@ func main() {
 		err = mcpserver.Run(os.Stdin, os.Stdout)
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "gate":
+		err = cmdGate(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -96,6 +98,9 @@ usage:
   usher backend list                show registered backends
   usher backend add NAME -- CMD...  register a stdio backend
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher gate block TOOL             add a bare tool name to the block-list
+  usher gate unblock TOOL           allow-list a bare tool name (override; always wins)
+  usher gate list                   show the effective block-list + allow-list
   usher version
 
 control-plane UI (served by serve --socket / start):
