@@ -59,6 +59,8 @@ func main() {
 		err = cmdConfig(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "gate":
+		err = cmdGate(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -117,6 +119,9 @@ usage:
   usher config init [--force]       scaffold a starter config.json (--force overwrites)
   usher doctor                      health-probe every registered backend (table; exit !=0 if any fail)
   usher completion bash|zsh|fish    print a shell completion script to stdout
+  usher gate block TOOL             add a bare tool name to the block-list
+  usher gate unblock TOOL           allow-list a bare tool name (override; always wins)
+  usher gate list                   show the effective block-list + allow-list
   usher version
 
 control-plane UI (served by serve --socket / start):
