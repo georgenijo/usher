@@ -38,12 +38,13 @@ const EnvAddr = "USHER_UI_ADDR"
 // live-connection registry (also Hub-fed) for GET /api/connections. cfgJSON is
 // the redacted config the UI shows; it is captured once at construction.
 type Server struct {
-	bus  *broker.Hub
-	sv   *broker.BackendSupervisor
-	reg  *connRegistry
-	res  *resourceState
-	mux  *http.ServeMux
-	addr string
+	bus     *broker.Hub
+	sv      *broker.BackendSupervisor
+	reg     *connRegistry
+	res     *resourceState
+	metrics *metricsState
+	mux     *http.ServeMux
+	addr    string
 
 	// cfgSnapshot is the config view served by GET /api/config, captured at New so
 	// the handler never re-reads disk on the hot path. It carries no secrets (the
@@ -64,6 +65,7 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 		sv:          sv,
 		reg:         newConnRegistry(),
 		res:         newResourceState(),
+		metrics:     newMetricsState(),
 		mux:         http.NewServeMux(),
 		cfgSnapshot: cfgSnapshot,
 	}
@@ -80,6 +82,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/connections", s.handleConnections)
 	s.mux.HandleFunc("GET /api/resources", s.handleResources)
 	s.mux.HandleFunc("GET /api/config", s.handleConfig)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.mux.HandleFunc("POST /api/backends/{name}/start", s.manage((*broker.BackendSupervisor).Start))
 	s.mux.HandleFunc("POST /api/backends/{name}/stop", s.manage((*broker.BackendSupervisor).Stop))
@@ -120,6 +123,7 @@ func (s *Server) SetAddr(addr string) { s.addr = addr }
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go s.reg.Watch(ctx, s.bus)
 	go s.res.Watch(ctx, s.bus)
+	go s.metrics.Watch(ctx, s.bus)
 
 	srv := &http.Server{
 		Handler:           s.mux,
@@ -182,6 +186,24 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		cfg = struct{}{}
 	}
 	writeJSON(w, http.StatusOK, cfg)
+}
+
+// handleMetrics answers GET /metrics with the broker counters in Prometheus text
+// exposition format (plaintext "key value" lines, no client library). The
+// counters are read-only observations folded off the SAME event bus the broker
+// already emits to, so scraping never touches the forwarding hot path; the
+// backends-configured gauge is read live from the supervisor here (it is config,
+// not an event counter, and a nil supervisor reports zero — a bare test server).
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	backends := 0
+	if s.sv != nil {
+		backends = len(s.sv.Snapshot())
+	}
+	// Prometheus text format is UTF-8 text/plain version 0.0.4; a plain scraper or
+	// `grep` reads it either way.
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(s.metrics.render(backends)))
 }
 
 // manage builds a POST handler for a lifecycle action (Start/Stop/Restart),
