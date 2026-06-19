@@ -390,6 +390,13 @@ func (b *Broker) serveMuxConn(ctx context.Context, backendName string, c net.Con
 	if be != nil {
 		backendName = be.Name
 	}
+	// A disabled backend is registered but must never be spawned. Refuse to serve
+	// this connection rather than bring the child live; the audit trail records why
+	// before we drop the conn.
+	if be != nil && be.Disabled {
+		b.audit.Errorf(id.ID, "backend %q is disabled; refusing connection", be.Name)
+		return
+	}
 
 	// Close the conn on ctx cancel so a daemon shutdown unblocks this connection's
 	// blocking Read (the read then returns an error and the loop exits). done stops

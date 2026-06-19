@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -57,6 +58,70 @@ func TestStateDirPaths(t *testing.T) {
 	if got, want := DefaultPath(), filepath.Join(dir, "config.json"); got != want {
 		t.Errorf("DefaultPath() = %q, want %q", got, want)
 	}
+}
+
+// TestInit covers `usher config init`'s on-disk behavior using a temp state dir:
+// it creates the state dir and writes a config that round-trips through Load, it
+// refuses to clobber an existing config without force, and --force overwrites.
+func TestInit(t *testing.T) {
+	t.Run("creates state dir and writes a loadable starter config", func(t *testing.T) {
+		// A nested, not-yet-created state dir proves Init makes the directory.
+		dir := filepath.Join(t.TempDir(), "fresh", ".usher")
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+
+		if err := Init(path, false); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("config not written: %v", err)
+		}
+
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load round-trip: %v", err)
+		}
+		if len(cfg.Backends) != 0 {
+			t.Errorf("starter Backends = %v, want empty", cfg.Backends)
+		}
+	})
+
+	t.Run("refuses an existing config without force", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+		if err := Init(path, false); err != nil {
+			t.Fatalf("first Init: %v", err)
+		}
+
+		err := Init(path, false)
+		if !errors.Is(err, ErrConfigExists) {
+			t.Fatalf("Init over existing = %v, want ErrConfigExists", err)
+		}
+	})
+
+	t.Run("force overwrites an existing config", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("USHER_STATE_DIR", dir)
+		path := DefaultPath()
+
+		// Seed a non-starter config so we can prove --force replaced it.
+		seeded := &Config{Backends: []Backend{{Name: "old", Transport: "stdio", Auth: "inherit"}}}
+		if err := seeded.Save(path); err != nil {
+			t.Fatalf("seed Save: %v", err)
+		}
+
+		if err := Init(path, true); err != nil {
+			t.Fatalf("Init --force: %v", err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load after force: %v", err)
+		}
+		if len(cfg.Backends) != 0 {
+			t.Errorf("after --force Backends = %v, want empty (overwritten)", cfg.Backends)
+		}
+	})
 }
 
 // TestEnvForBackend covers the auth-strategy → env-additions mapping. The env
@@ -125,6 +190,37 @@ func TestEnvForBackend(t *testing.T) {
 	}
 }
 
+// TestRemove: Remove deletes a backend by name and reports whether it found
+// one, leaving the other backends intact; removing an absent name is a no-op
+// that returns false.
+func TestRemove(t *testing.T) {
+	c := &Config{Backends: []Backend{
+		{Name: "cua", Transport: "stdio", Auth: "inherit", Default: true},
+		{Name: "db", Transport: "stdio", Auth: "env", EnvKeys: []string{"DB_KEY"}},
+		{Name: "fs", Transport: "stdio", Auth: "none"},
+	}}
+
+	if ok := c.Remove("nope"); ok {
+		t.Error("Remove(nope) = true, want false (absent backend)")
+	}
+	if len(c.Backends) != 3 {
+		t.Fatalf("Remove(nope) mutated config: have %d backends, want 3", len(c.Backends))
+	}
+
+	if ok := c.Remove("db"); !ok {
+		t.Fatal("Remove(db) = false, want true")
+	}
+	if c.ResolveBackend("db") != nil {
+		t.Error("backend db still resolvable after Remove")
+	}
+	if c.ResolveBackend("cua") == nil || c.ResolveBackend("fs") == nil {
+		t.Error("Remove(db) dropped an unrelated backend")
+	}
+	if len(c.Backends) != 2 {
+		t.Errorf("have %d backends after Remove(db), want 2", len(c.Backends))
+	}
+}
+
 // TestConfigRoundTrip: a backend carrying EnvKeys survives a Save/Load cycle and
 // EnvKeys is preserved, while no secret value is ever serialized (only names).
 func TestConfigRoundTrip(t *testing.T) {
@@ -176,5 +272,48 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "ANTHROPIC_API_KEY") {
 		t.Errorf("config.json missing the env key NAME; envKeys should be serialized:\n%s", raw)
+	}
+}
+
+// TestBackendDisabledRoundTrip: the Disabled flag survives a Save/Load cycle when
+// true, and is OMITTED from the on-disk bytes when false (omitempty) so existing
+// configs that never set it are byte-for-byte unchanged.
+func TestBackendDisabledRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	in := &Config{
+		Backends: []Backend{
+			{Name: "cua", Transport: "stdio", Command: []string{"cua-driver", "mcp"}, Auth: "inherit", Default: true},
+			{Name: "fs", Transport: "stdio", Command: []string{"fs-mcp"}, Auth: "none", Disabled: true},
+		},
+	}
+	if err := in.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Fatalf("round-trip mismatch:\n in = %+v\nout = %+v", in, out)
+	}
+
+	fs := out.ResolveBackend("fs")
+	if fs == nil || !fs.Disabled {
+		t.Errorf("fs.Disabled = %v, want true", fs)
+	}
+
+	// The enabled backend ("cua", Disabled=false) must NOT serialize a "disabled"
+	// key — omitempty keeps pre-existing configs unchanged on disk.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"disabled": true`) {
+		t.Errorf("config.json missing the disabled flag for fs:\n%s", raw)
+	}
+	if strings.Count(string(raw), "disabled") != 1 {
+		t.Errorf("config.json has more than one \"disabled\" key; false should be omitted:\n%s", raw)
 	}
 }

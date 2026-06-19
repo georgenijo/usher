@@ -86,9 +86,29 @@ func (b *Broker) StartAuditSubscriber(ctx context.Context) {
 	go RunAuditSubscriber(ctx, b.bus, b.audit)
 }
 
-// New builds a broker from config, logging audit to stderr.
+// New builds a broker from config, logging audit to stderr at the default
+// (normal) verbosity — every line emits.
 func New(cfg *config.Config) (*Broker, error) {
-	al := audit.New(os.Stderr)
+	return NewWithLevel(cfg, audit.LevelNormal)
+}
+
+// NewWithLevel builds a broker from config, logging audit to stderr at the given
+// verbosity AND to a rotating file under the state dir. The file is an
+// additional, durable copy: stderr behaviour is unchanged. If the file sink
+// cannot be opened (unwritable state dir), the broker degrades to stderr-only
+// rather than failing to start — audit is a record, not a gate on serving.
+//
+// `usher serve --quiet/--verbose` selects the level here; only the informational
+// Infof lifecycle lines are gated — errors, gate-blocked/security lines, and the
+// core per-message audit always emit (#log-verbosity, #audit-rotation).
+func NewWithLevel(cfg *config.Config, level audit.Level) (*Broker, error) {
+	var auditW io.Writer = os.Stderr
+	if sink, err := audit.NewFileSink(cfg.AuditPath(), cfg.AuditMaxBytes, cfg.AuditKeep); err != nil {
+		fmt.Fprintf(os.Stderr, "usher: audit file sink disabled: %v\n", err)
+	} else {
+		auditW = io.MultiWriter(os.Stderr, sink)
+	}
+	al := audit.NewLevel(auditW, level)
 	// A zero (unset) config threshold means "use the built-in default".
 	trimThreshold := DefaultTrimThreshold
 	if cfg.TrimThreshold > 0 {
@@ -261,6 +281,9 @@ func (b *Broker) serveConn(ctx context.Context, backendName string, conn net.Con
 	be := b.cfg.ResolveBackend(backendName)
 	if be == nil {
 		return fmt.Errorf("no backend configured (run: usher backend add <name> -- <command...>)")
+	}
+	if be.Disabled {
+		return fmt.Errorf("backend %q is disabled (enable it before serving)", be.Name)
 	}
 	if be.Transport != "stdio" {
 		return fmt.Errorf("backend %q: transport %q not supported yet", be.Name, be.Transport)

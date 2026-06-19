@@ -29,6 +29,13 @@ type Backend struct {
 	EnvKeys []string `json:"envKeys,omitempty"`
 
 	Default bool `json:"default,omitempty"`
+
+	// Disabled, when true, removes the backend from multi-backend enumeration
+	// ("usher serve --all") so it is never spawned, while leaving it registered.
+	// This is SELECTION metadata only — it does not touch the pipeline or message
+	// handling. omitempty keeps existing configs (and false here) byte-for-byte
+	// unchanged on disk.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // Config is the whole usher state file.
@@ -72,6 +79,21 @@ type Config struct {
 	// over the socket but never binds the HTTP listener. The --ui-off flag forces
 	// this for a single run; this is the persistent default.
 	UIOff bool `json:"uiOff,omitempty"`
+
+	// AuditLogPath overrides where the broker's rotating audit log lives. Empty
+	// (the unset default) means StateDir()/audit.log, so zero-config still gets a
+	// durable on-disk copy alongside the stderr stream.
+	AuditLogPath string `json:"auditLogPath,omitempty"`
+
+	// AuditMaxBytes is the size (in bytes) the active audit log may reach before
+	// the sink rotates it. Zero (unset) means use the audit package's built-in
+	// default (audit.DefaultMaxBytes).
+	AuditMaxBytes int64 `json:"auditMaxBytes,omitempty"`
+
+	// AuditKeep is how many rotated audit files (audit.log.1 .. audit.log.K) the
+	// sink retains before pruning the oldest. Zero (unset) means use the audit
+	// package's built-in default (audit.DefaultKeep).
+	AuditKeep int `json:"auditKeep,omitempty"`
 }
 
 // EnvAllowTools is the environment variable that allow-lists destructive tools
@@ -133,6 +155,20 @@ func SocketPath() string { return filepath.Join(StateDir(), "usher.sock") }
 // stopped from stale, without a flock dependency.
 func PidPath() string { return filepath.Join(StateDir(), "usher.pid") }
 
+// DefaultAuditLogPath is the rotating audit log location inside the state dir,
+// used when AuditLogPath is unset.
+func DefaultAuditLogPath() string { return filepath.Join(StateDir(), "audit.log") }
+
+// AuditPath resolves the audit log location: the AuditLogPath override when set,
+// otherwise DefaultAuditLogPath. A relative override is taken as-is (resolved
+// against the process cwd) so an operator can point it anywhere.
+func (c *Config) AuditPath() string {
+	if c.AuditLogPath != "" {
+		return c.AuditLogPath
+	}
+	return DefaultAuditLogPath()
+}
+
 // UIURLPath is the file the daemon writes with the dashboard URL it actually
 // bound, so `usher status` and `usher ui` (separate processes that cannot see
 // the daemon's runtime --ui-port flag) report the live address rather than
@@ -162,6 +198,34 @@ func Default() *Config {
 			Default:   true,
 		}},
 	}
+}
+
+// Starter is the config written by `usher config init`: a valid, parseable file
+// with an empty backends list. Unlike Default (which seeds the cua backend for an
+// unconfigured runtime), the scaffold hardcodes no backend — the operator adds
+// their own with `usher backend add`. encoding/json has no comments, so the file
+// carries no inline guidance; the init command prints next-steps to stderr.
+func Starter() *Config {
+	return &Config{Backends: []Backend{}}
+}
+
+// ErrConfigExists is returned by Init when a config already lives at the target
+// path and the caller did not request an overwrite. The init command turns this
+// into a refusal that points the operator at --force.
+var ErrConfigExists = errors.New("config already exists")
+
+// Init scaffolds a starter config at path. It creates the enclosing state dir if
+// missing. When a config already exists it refuses with ErrConfigExists unless
+// force is set, in which case the existing file is overwritten.
+func Init(path string, force bool) error {
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s: %w", path, ErrConfigExists)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return Starter().Save(path)
 }
 
 // Load reads the config at path, or returns the built-in Default when the file
@@ -231,6 +295,21 @@ func (c *Config) Add(b Backend, makeDefault bool) {
 		}
 	}
 	c.Backends = append(c.Backends, b)
+}
+
+// Remove deletes the backend named name and reports whether one was found. It
+// only mutates the in-memory slice; the caller persists with Save and is
+// responsible for purging the backend's Keychain secrets (auth=env). A removed
+// default backend leaves the config with no default — ResolveBackend("") then
+// falls back to the first remaining backend.
+func (c *Config) Remove(name string) bool {
+	for i := range c.Backends {
+		if c.Backends[i].Name == name {
+			c.Backends = append(c.Backends[:i], c.Backends[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // keychainGet is the indirection used by EnvForBackend to read secrets. It is a

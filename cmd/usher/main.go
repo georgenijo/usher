@@ -7,18 +7,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	"github.com/georgenijo/usher/internal/audit"
 	"github.com/georgenijo/usher/internal/backend"
 	"github.com/georgenijo/usher/internal/broker"
 	"github.com/georgenijo/usher/internal/config"
@@ -49,8 +53,19 @@ func main() {
 		// distinct backend TYPE usher can front; register it with:
 		//   usher backend add mcpserver -- /abs/path/to/usher mcpserver
 		err = mcpserver.Run(os.Stdin, os.Stdout)
+	case "selftest":
+		// Built-in end-to-end smoke test: drive the full MCP handshake plus one
+		// tools/call THROUGH the broker against the bundled mcpserver, in a temp
+		// state dir. PASS/FAIL with detail; exits non-zero on failure.
+		err = cmdSelftest(os.Args[2:])
 	case "backend":
 		err = cmdBackend(os.Args[2:])
+	case "config":
+		err = cmdConfig(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
+	case "gate":
+		err = cmdGate(os.Args[2:])
 	case "start":
 		err = cmdStart(os.Args[2:])
 	case "stop":
@@ -63,6 +78,8 @@ func main() {
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
 		err = cmdUninstall(os.Args[2:])
+	case "completion":
+		err = cmdCompletion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -85,17 +102,32 @@ usage:
                                     (backends start lazily on first client; --prewarm starts eager)
   usher serve --all                 aggregate ALL backends (namespaced tools)
   usher serve --backends cua,fs     aggregate the named backends
+  usher serve --quiet               suppress info/lifecycle logs (errors + blocked + audit stay)
+  usher serve --verbose             full-detail logging
   usher mcpserver                   run the homegrown hermetic MCP server (echo/add/now)
                                     register it: usher backend add mcpserver -- <usher path> mcpserver
+  usher selftest                    end-to-end broker smoke test (bundled backend, temp state dir)
   usher start [--backend NAME]      launch the daemon in the background
   usher stop                        stop the background daemon
-  usher status                      print daemon status (running/stopped/stale + UI url)
+  usher status [--json]             print daemon status (running/stopped/stale + UI url)
   usher ui                          open the control-plane dashboard in the browser
   usher install [--backend NAME]    install + load the launchd LaunchAgent
   usher uninstall                   unload + remove the launchd LaunchAgent
-  usher backend list                show registered backends
+  usher backend list [--json]       show registered backends
+  usher backend show NAME           inspect one backend in detail
   usher backend add NAME -- CMD...  register a stdio backend
+  usher backend remove NAME         deregister a backend (alias: rm; purges auth=env Keychain keys)
+  usher backend rename OLD NEW      rename a backend + migrate its Keychain secrets
   usher backend probe NAME          re-run the initialize handshake against a backend
+  usher backend export [--out FILE] write all backends as JSON (no secrets) to stdout/FILE
+  usher backend import [--force] F  add backends from JSON F (handshake-validated; --force overwrites)
+  usher config check                validate config.json (no daemon); exits non-zero on error
+  usher config init [--force]       scaffold a starter config.json (--force overwrites)
+  usher doctor                      health-probe every registered backend (table; exit !=0 if any fail)
+  usher completion bash|zsh|fish    print a shell completion script to stdout
+  usher gate block TOOL             add a bare tool name to the block-list
+  usher gate unblock TOOL           allow-list a bare tool name (override; always wins)
+  usher gate list                   show the effective block-list + allow-list
   usher version
 
 control-plane UI (served by serve --socket / start):
@@ -127,8 +159,13 @@ func cmdServe(args []string) error {
 	uiPort := fs.Int("ui-port", 0, "control-plane UI port on 127.0.0.1 (0: config or built-in default)")
 	uiOff := fs.Bool("ui-off", false, "disable the control-plane web UI (serve MCP only)")
 	prewarm := fs.Bool("prewarm", false, "bring the default backend live at daemon start instead of lazily on the first client")
+	quiet := fs.Bool("quiet", false, "suppress info/lifecycle log lines (errors, gate-blocked, and core audit still emit)")
+	verbose := fs.Bool("verbose", false, "full-detail logging (default verbosity plus any debug lines)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *quiet && *verbose {
+		return fmt.Errorf("--quiet and --verbose are mutually exclusive")
 	}
 
 	cfg, err := config.Load(config.DefaultPath())
@@ -139,7 +176,17 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	b, err := broker.New(cfg)
+	// Map the verbosity flags to the audit level; default is normal (the
+	// historical behavior). Only Infof lifecycle lines are gated (#log-verbosity).
+	level := audit.LevelNormal
+	switch {
+	case *quiet:
+		level = audit.LevelQuiet
+	case *verbose:
+		level = audit.LevelVerbose
+	}
+
+	b, err := broker.NewWithLevel(cfg, level)
 	if err != nil {
 		return err
 	}
@@ -304,25 +351,206 @@ func splitBackends(s string) []string {
 // cmdBackend handles the backend control subcommands.
 func cmdBackend(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: usher backend <list|add|probe> ...")
+		return fmt.Errorf("usage: usher backend <list|show|add|remove|rename|probe|export|import> ...")
 	}
 	switch args[0] {
 	case "list":
-		return backendList()
+		return backendList(args[1:])
+	case "show":
+		return backendShow(args[1:])
 	case "add":
 		return backendAdd(args[1:])
+	case "remove", "rm":
+		return backendRemove(args[1:])
+	case "rename":
+		return backendRename(args[1:])
 	case "probe":
 		return backendProbe(args[1:])
+	case "export":
+		return backendExport(args[1:])
+	case "import":
+		return backendImport(args[1:])
 	default:
-		return fmt.Errorf("unknown backend subcommand %q (want list|add|probe)", args[0])
+		return fmt.Errorf("unknown backend subcommand %q (want list|show|add|remove|rename|probe|export|import)", args[0])
 	}
 }
 
-func backendList() error {
+// cmdConfig handles the config control subcommands. The dispatch mirrors
+// cmdBackend so adding `config edit`/`config show` later is a one-line case.
+func cmdConfig(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: usher config <check|init> ...")
+	}
+	switch args[0] {
+	case "check":
+		return configCheck(args[1:])
+	case "init":
+		return configInit(args[1:])
+	default:
+		return fmt.Errorf("unknown config subcommand %q (want check|init)", args[0])
+	}
+}
+
+// configCheck validates config.json without starting the daemon. The validation
+// logic lives in internal/config (CheckFile); this wiring stays thin: load,
+// print the report, and exit non-zero when there is any ERROR finding.
+func configCheck(args []string) error {
+	fs := flag.NewFlagSet("config check", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := config.DefaultPath()
+	res, err := config.CheckFile(path)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("checking %s\n", path)
+	var sb strings.Builder
+	res.Report(&sb)
+	fmt.Print(sb.String())
+	if res.HasError() {
+		// Surface a non-zero exit without the duplicate "usher: ..." prefix main
+		// adds for ordinary errors — the report already explains the failures.
+		os.Exit(1)
+	}
+	return nil
+}
+
+// configInit scaffolds a starter config.json at config.DefaultPath(). It refuses
+// to clobber an existing config unless --force is passed. The written JSON has no
+// comments (encoding/json can't emit them), so the next-steps hint goes to stderr
+// while the path written goes to stdout.
+func configInit(args []string) error {
+	fs := flag.NewFlagSet("config init", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite an existing config")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	path := config.DefaultPath()
+	if err := config.Init(path, *force); err != nil {
+		if errors.Is(err, config.ErrConfigExists) {
+			return fmt.Errorf("%w (pass --force to overwrite)", err)
+		}
+		return err
+	}
+
+	fmt.Println(path)
+	fmt.Fprintf(os.Stderr, `wrote starter config (empty backends list).
+
+next steps:
+  usher backend add NAME -- COMMAND...   register a backend
+  usher backend list                     show registered backends
+  usher serve --socket                   start the daemon
+`)
+	return nil
+}
+
+// backendRemove deregisters the backend named in args[0] (alias `rm`). It loads
+// the config, removes the entry, and — for auth=env backends — purges each of
+// the backend's namespaced Keychain secrets (service usher.<name>, account = the
+// env-var name). It prints exactly what was removed. A missing backend is a
+// clear error before anything is touched.
+//
+// The --yes flag exists for scripting symmetry (and a future confirm prompt);
+// removal is non-interactive today, so it is accepted and ignored.
+func backendRemove(args []string) error {
+	fs := flag.NewFlagSet("backend remove", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip confirmation (no-op today; reserved for scripting)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	_ = *yes
+	rest := fs.Args()
+	if len(rest) != 1 || rest[0] == "" {
+		return fmt.Errorf("usage: usher backend remove [--yes] NAME")
+	}
+	name := rest[0]
+
+	path := config.DefaultPath()
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot the backend before removing it so we know its auth strategy and
+	// EnvKeys for the Keychain purge below; error clearly if it is absent.
+	be := cfg.ResolveBackend(name)
+	if be == nil {
+		return fmt.Errorf("no backend named %q (run: usher backend list)", name)
+	}
+	auth, envKeys := be.Auth, append([]string(nil), be.EnvKeys...)
+
+	if !cfg.Remove(name) {
+		// ResolveBackend already matched, so this should not happen; guard anyway.
+		return fmt.Errorf("no backend named %q", name)
+	}
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("removed backend %q from %s\n", name, path)
+
+	// Purge the backend's Keychain secrets only for auth=env. Keys are namespaced
+	// to the backend (service usher.<name>), so deleting them cannot touch another
+	// backend's secrets. keychain.Delete is idempotent — a missing item is fine —
+	// but a real Keychain error is surfaced (config is already saved, so this is
+	// reported, not rolled back).
+	if auth == "env" {
+		for _, k := range envKeys {
+			if err := keychainDelete(name, k); err != nil {
+				return fmt.Errorf("purge Keychain secret %s/%s: %w", name, k, err)
+			}
+			fmt.Printf("purged Keychain secret %s (service usher.%s)\n", k, name)
+		}
+	}
+	return nil
+}
+
+// backendListJSON is the machine-readable shape of one registered backend, a
+// stable subset of config.Backend chosen for tooling (--json). It is a distinct
+// type so the on-disk config schema can evolve without silently changing the CLI
+// contract, and so secrets never leak: only the env-var NAMES (envKeys) appear,
+// never values (which live in the Keychain).
+type backendListJSON struct {
+	Name      string   `json:"name"`
+	Transport string   `json:"transport"`
+	Auth      string   `json:"auth"`
+	Command   []string `json:"command,omitempty"`
+	EnvKeys   []string `json:"envKeys,omitempty"`
+	Default   bool     `json:"default"`
+}
+
+func backendList(args []string) error {
+	fs := flag.NewFlagSet("backend list", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "emit a JSON array of backends instead of a table")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	cfg, err := config.Load(config.DefaultPath())
 	if err != nil {
 		return err
 	}
+
+	// --json: a JSON array of backends for scripting. Always emit an array (never
+	// `null`) so consumers can iterate unconditionally even with no backends.
+	if *asJSON {
+		out := make([]backendListJSON, 0, len(cfg.Backends))
+		for _, be := range cfg.Backends {
+			out = append(out, backendListJSON{
+				Name:      be.Name,
+				Transport: be.Transport,
+				Auth:      be.Auth,
+				Command:   be.Command,
+				EnvKeys:   be.EnvKeys,
+				Default:   be.Default,
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tTRANSPORT\tAUTH\tDEFAULT\tCOMMAND")
 	for _, be := range cfg.Backends {
@@ -330,7 +558,78 @@ func backendList() error {
 		if be.Default {
 			def = "*"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\n", be.Name, be.Transport, be.Auth, def, be.Command)
+		name := be.Name
+		if be.Disabled {
+			name += " (disabled)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\n", name, be.Transport, be.Auth, def, be.Command)
+	}
+	return w.Flush()
+}
+
+// backendShow renders a detailed, read-only view of a single registered backend:
+// its name, transport, auth strategy, and (for stdio) the command + args. For
+// auth=env it lists each EnvKey NAME and whether the secret is present in the
+// Keychain (service usher.<name>) as "set" / "MISSING". The secret VALUE is
+// NEVER printed. Keychain lookups degrade gracefully: an unavailable Keychain
+// is reported as "unknown" rather than failing the command.
+func backendShow(args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return fmt.Errorf("usage: usher backend show NAME")
+	}
+	name := args[0]
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	// Match by exact name only — unlike ResolveBackend, "show" never falls back
+	// to the default backend, so an absent name is an unambiguous error.
+	var be *config.Backend
+	for i := range cfg.Backends {
+		if cfg.Backends[i].Name == name {
+			be = &cfg.Backends[i]
+			break
+		}
+	}
+	if be == nil {
+		return fmt.Errorf("no backend named %q", name)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintf(w, "Name:\t%s\n", be.Name)
+	fmt.Fprintf(w, "Transport:\t%s\n", be.Transport)
+	fmt.Fprintf(w, "Auth:\t%s\n", be.Auth)
+	fmt.Fprintf(w, "Default:\t%v\n", be.Default)
+	if be.Transport == "stdio" {
+		if len(be.Command) > 0 {
+			fmt.Fprintf(w, "Command:\t%s\n", be.Command[0])
+			if len(be.Command) > 1 {
+				fmt.Fprintf(w, "Args:\t%s\n", strings.Join(be.Command[1:], " "))
+			}
+		} else {
+			fmt.Fprintf(w, "Command:\t(none)\n")
+		}
+	}
+	if be.Auth == "env" {
+		if len(be.EnvKeys) == 0 {
+			fmt.Fprintf(w, "Env keys:\t(none)\n")
+		}
+		for i, k := range be.EnvKeys {
+			label := "Env keys:"
+			if i > 0 {
+				label = ""
+			}
+			// Report presence WITHOUT exposing the value: a found secret is
+			// "set", an absent one "MISSING", and a Keychain we cannot read
+			// (e.g. unavailable in the test/CI environment) "unknown".
+			status := "set"
+			if _, err := keychainGet(be.Name, k); errors.Is(err, keychain.ErrNotFound) {
+				status = "MISSING"
+			} else if err != nil {
+				status = "unknown"
+			}
+			fmt.Fprintf(w, "%s\t%s (%s)\n", label, k, status)
+		}
 	}
 	return w.Flush()
 }
@@ -442,41 +741,144 @@ func backendAdd(args []string) error {
 		Auth:      *auth,
 		EnvKeys:   []string(envKeys),
 	}
-	cfg.Add(be, *makeDefault)
 
-	// Handshake-validate-BEFORE-save: the done criterion is "refuse to register
-	// if the handshake fails (with a clear message)." So we probe first and only
-	// persist a backend that actually speaks MCP — a handshake failure is fatal
-	// and the config is left untouched.
-	//
-	// The lone advisory exception is when the auth env cannot be resolved yet
-	// (e.g. a key not yet in the Keychain, an OAuth flow still pending). That is a
-	// legitimately pre-install state, not a broken backend, so we register
-	// without probing and tell the user how to verify later. We resolve against a
-	// transient copy that is added to cfg but NOT yet saved.
-	probeBe := cfg.ResolveBackend(name)
+	skipped, err := validateAndSaveBackend(cfg, path, be, *makeDefault)
+	if err != nil {
+		return fmt.Errorf("backend %q handshake failed, not registered: %w\n  (fix the command/key, then re-run: usher backend add %s ...)", name, err, name)
+	}
+	if skipped {
+		return nil // advisory already printed
+	}
+	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
+	return nil
+}
+
+// validateAndSaveBackend is the canonical handshake-validate-BEFORE-save gate
+// shared by `backend add` and `backend import`. It adds be to cfg, probes the
+// MCP handshake, and only persists cfg to path on success — a handshake failure
+// is fatal and leaves the on-disk config untouched (the caller wraps the error
+// with a command-specific hint).
+//
+// The lone advisory exception is when the auth env cannot be resolved yet (e.g.
+// a key not yet in the Keychain, an OAuth flow still pending). That is a
+// legitimately pre-install state, not a broken backend, so we register without
+// probing, print a verify-later hint, and report skipped=true so the caller
+// suppresses its own success line.
+func validateAndSaveBackend(cfg *config.Config, path string, be config.Backend, makeDefault bool) (skipped bool, err error) {
+	cfg.Add(be, makeDefault)
+
+	// Resolve auth env against a transient copy that is added to cfg but NOT yet
+	// saved.
+	probeBe := cfg.ResolveBackend(be.Name)
 	envExtra, err := config.EnvForBackend(probeBe)
 	if err != nil {
 		// Auth env not yet resolvable: register without probing (advisory).
-		if err := cfg.Save(path); err != nil {
-			return err
+		if serr := cfg.Save(path); serr != nil {
+			return false, serr
 		}
 		fmt.Fprintf(os.Stderr, "usher: warning: cannot resolve auth env: %v\n", err)
-		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", name, name)
-		return nil
+		fmt.Fprintf(os.Stderr, "usher: backend %q registered but probe skipped; verify with: usher backend probe %s\n", be.Name, be.Name)
+		return true, nil
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := probeBackend(probeCtx, probeBe, envExtra); err != nil {
 		// Handshake failed: refuse to register and leave config untouched.
-		return fmt.Errorf("backend %q handshake failed, not registered: %w\n  (fix the command/key, then re-run: usher backend add %s ...)", name, err, name)
+		return false, err
 	}
 
 	// Handshake ok — now persist.
 	if err := cfg.Save(path); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// Keychain indirections used by backendRename, backendRemove, and backendShow so
+// tests can substitute an in-memory store and never touch the real login
+// Keychain. Production wires the real /usr/bin/security-backed implementations
+// from internal/keychain.
+var (
+	keychainGet    = keychain.Get
+	keychainSet    = keychain.Set
+	keychainDelete = keychain.Delete
+)
+
+// backendRename renames an already-registered backend from OLD to NEW and, when
+// the backend's auth strategy is env, migrates its secrets in the Keychain from
+// service usher.<old> to service usher.<new> (read → write → delete the old).
+//
+//	usher backend rename OLD NEW
+//
+// It refuses when OLD is absent or NEW already exists, and saves the config only
+// after the rename is applied in memory. A Keychain read that fails for one key
+// is a warning (the rename continues for the rest) rather than a hard abort, so
+// a single missing/locked item doesn't leave the config and the Keychain
+// permanently out of step.
+func backendRename(args []string) error {
+	if len(args) != 2 || args[0] == "" || args[1] == "" {
+		return fmt.Errorf("usage: usher backend rename OLD NEW")
+	}
+	oldName, newName := args[0], args[1]
+	if oldName == newName {
+		return fmt.Errorf("OLD and NEW are the same name %q; nothing to rename", oldName)
+	}
+
+	path := config.DefaultPath()
+	cfg, err := config.Load(path)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("registered backend %q -> %v (transport=%s, auth=%s, handshake: ok)\n", name, cmd, *transport, *auth)
+
+	// Locate OLD and guard NEW in one pass so we fail before mutating anything.
+	src := -1
+	for i := range cfg.Backends {
+		switch cfg.Backends[i].Name {
+		case oldName:
+			src = i
+		case newName:
+			return fmt.Errorf("backend %q already exists; choose a different NEW name", newName)
+		}
+	}
+	if src == -1 {
+		return fmt.Errorf("no backend named %q", oldName)
+	}
+
+	be := &cfg.Backends[src]
+
+	// Migrate Keychain secrets BEFORE renaming the config key, so each read still
+	// targets service usher.<old>. auth=env is the only strategy with secrets; all
+	// others migrate nothing. A failed read for one key is a warning (skip it and
+	// continue) so one bad item can't abort the whole rename.
+	var migrated []string
+	if be.Auth == "env" {
+		for _, k := range be.EnvKeys {
+			secret, err := keychainGet(oldName, k)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain read %s/%s failed, skipping migration of this key: %v\n", oldName, k, err)
+				continue
+			}
+			if err := keychainSet(newName, k, secret); err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain write %s/%s failed, skipping migration of this key: %v\n", newName, k, err)
+				continue
+			}
+			if err := keychainDelete(oldName, k); err != nil {
+				fmt.Fprintf(os.Stderr, "usher: warning: keychain delete %s/%s failed (secret copied to %s, stale item remains): %v\n", oldName, k, newName, err)
+			}
+			migrated = append(migrated, k)
+		}
+	}
+
+	// Apply the rename and persist. Save writes atomically via config.Save.
+	be.Name = newName
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+
+	fmt.Printf("renamed backend %q -> %q\n", oldName, newName)
+	for _, k := range migrated {
+		fmt.Printf("  migrated keychain secret %s: usher.%s -> usher.%s\n", k, oldName, newName)
+	}
 	return nil
 }
 
@@ -511,19 +913,288 @@ func backendProbe(args []string) error {
 	return nil
 }
 
+// backendExport writes every registered backend as a JSON array to stdout (or to
+// --out FILE). Each entry carries name, transport, auth, command/args, and the
+// env key NAMES — the same fields that live in config.json. Secret VALUES are
+// never exported: they live exclusively in the Keychain (config.Backend has no
+// field for them), so the marshaled portable record cannot leak a secret.
+func backendExport(args []string) error {
+	fs := flag.NewFlagSet("backend export", flag.ContinueOnError)
+	out := fs.String("out", "", "write to FILE instead of stdout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+
+	// Marshal config.Backend records: they have no secret field, so name/transport/
+	// auth/command/envKeys (names only) are exactly what gets written. Default is
+	// intentionally cleared — "default" is a property of one machine's setup, not a
+	// portable attribute of the backend; import never sets a default either.
+	backends := make([]config.Backend, len(cfg.Backends))
+	copy(backends, cfg.Backends)
+	for i := range backends {
+		backends[i].Default = false
+	}
+	b, err := json.MarshalIndent(backends, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+
+	if *out == "" {
+		_, err := os.Stdout.Write(b)
+		return err
+	}
+	if err := os.WriteFile(*out, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "usher: exported %d backend(s) to %s\n", len(backends), *out)
+	return nil
+}
+
+// backendImport reads a JSON array produced by `backend export` and registers
+// each backend, HANDSHAKE-VALIDATING before saving (the same gate as
+// `backend add` — a backend that does not speak MCP is refused). On a name
+// collision with an already-registered backend it skips the entry unless
+// --force is set. The import is incremental: each backend that passes its
+// handshake is persisted, so a later failure does not roll back earlier ones,
+// and the failing backend is left out of config.json.
+func backendImport(args []string) error {
+	fs := flag.NewFlagSet("backend import", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite a backend whose name already exists")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 || rest[0] == "" {
+		return fmt.Errorf("usage: usher backend import [--force] FILE")
+	}
+	file := rest[0]
+
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	var incoming []config.Backend
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return fmt.Errorf("parse %s: %w (expected a JSON array from `usher backend export`)", file, err)
+	}
+
+	path := config.DefaultPath()
+	var imported, skipped, failed int
+	for _, be := range incoming {
+		if be.Name == "" {
+			return fmt.Errorf("import: entry with empty name in %s", file)
+		}
+
+		// Reload per entry so each successful import is observed by the next
+		// collision check and the on-disk config grows incrementally.
+		cfg, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		if existing := cfg.ResolveBackend(be.Name); existing != nil && !*force {
+			fmt.Fprintf(os.Stderr, "usher: skipping %q: a backend with that name already exists (use --force to overwrite)\n", be.Name)
+			skipped++
+			continue
+		}
+
+		// Default is never imported — it is a per-machine property; importing must
+		// not silently steal the default away from an existing backend.
+		be.Default = false
+		// Handshake-validate before saving (reuses the add gate); never makeDefault.
+		advisory, verr := validateAndSaveBackend(cfg, path, be, false)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "usher: skipping %q: handshake failed: %v\n", be.Name, verr)
+			failed++
+			continue
+		}
+		if advisory {
+			// Registered but probe skipped (auth env not yet resolvable); the helper
+			// already printed the verify-later hint.
+			imported++
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "usher: imported %q (handshake: ok)\n", be.Name)
+		imported++
+	}
+
+	fmt.Fprintf(os.Stderr, "usher: import complete: %d imported, %d skipped, %d failed\n", imported, skipped, failed)
+	if failed > 0 {
+		return fmt.Errorf("%d backend(s) failed to import", failed)
+	}
+	return nil
+}
+
+// cmdDoctor health-probes every registered backend and prints a status table —
+// the scriptable companion to `backend probe` (which targets one). It reuses the
+// shared probeBackendDetail engine: spawn, initialize (timed), tools/list. Each
+// backend is probed concurrently under its own ~10s deadline so one slow/hung
+// backend doesn't serialize the whole run. The process exits non-zero if any
+// backend fails, so `usher doctor && deploy` works in scripts.
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", 10*time.Second, "per-backend handshake timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return err
+	}
+	if len(cfg.Backends) == 0 {
+		fmt.Println("no backends registered (add one: usher backend add NAME -- CMD...)")
+		return nil
+	}
+
+	type row struct {
+		name    string
+		ok      bool
+		latency time.Duration
+		tools   int
+		errMsg  string
+	}
+	rows := make([]row, len(cfg.Backends))
+
+	var wg sync.WaitGroup
+	for i := range cfg.Backends {
+		be := &cfg.Backends[i]
+		rows[i].name = be.Name
+		// http (and other) transports can't be stdio-probed yet — mark, don't spawn.
+		if be.Transport != "stdio" {
+			rows[i].errMsg = fmt.Sprintf("transport %q not probeable (stdio only)", be.Transport)
+			continue
+		}
+		envExtra, eerr := config.EnvForBackend(be)
+		if eerr != nil {
+			rows[i].errMsg = eerr.Error()
+			continue
+		}
+		wg.Add(1)
+		go func(i int, be *config.Backend, envExtra []string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+			defer cancel()
+			res, perr := probeBackendDetail(ctx, be, envExtra)
+			if perr != nil {
+				rows[i].errMsg = perr.Error()
+				return
+			}
+			rows[i].ok = true
+			rows[i].latency = res.Latency
+			rows[i].tools = res.Tools
+		}(i, be, envExtra)
+	}
+	wg.Wait()
+
+	failed := 0
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "BACKEND\tSTATUS\tLATENCY\tTOOLS\tERROR")
+	for _, r := range rows {
+		if r.ok {
+			fmt.Fprintf(w, "%s\tok\t%s\t%d\t\n", r.name, r.latency.Round(time.Millisecond), r.tools)
+			continue
+		}
+		failed++
+		fmt.Fprintf(w, "%s\tFAIL\t-\t-\t%s\n", r.name, r.errMsg)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	if failed > 0 {
+		return fmt.Errorf("%d of %d backend(s) failed health probe", failed, len(rows))
+	}
+	return nil
+}
+
 // probeBackend spawns the backend, completes the MCP initialize handshake, and
 // tears it down. It is the canonical validation gate for backend add/probe: on
 // success the caller can trust the command runs and speaks MCP. The context's
 // deadline (and exec.CommandContext under it) kills a backend that hangs or
-// never answers, so a long-lived daemon cannot wedge the probe.
+// never answers, so a long-lived daemon cannot wedge the probe. It is a thin
+// wrapper over probeBackendDetail (which add/probe don't need the metrics of).
 func probeBackend(ctx context.Context, be *config.Backend, envExtra []string) error {
+	_, err := probeBackendDetail(ctx, be, envExtra)
+	return err
+}
+
+// probeResult carries the measured outcome of a backend health probe: the
+// initialize round-trip latency and the tool count reported by tools/list.
+type probeResult struct {
+	Latency time.Duration // initialize request -> response round-trip
+	Tools   int           // tools advertised by tools/list (0 if it declines)
+}
+
+// probeBackendDetail spawns the backend, completes the MCP initialize handshake,
+// then lists its tools — measuring initialize latency and counting tools along
+// the way. It is the shared engine behind `backend add`/`backend probe` (which
+// only care that err == nil) and `usher doctor` (which renders the metrics).
+// A backend that hangs is bounded by the context deadline, never blocking Read
+// forever. The handshake itself is never mutated — this is a plain MCP client.
+func probeBackendDetail(ctx context.Context, be *config.Backend, envExtra []string) (probeResult, error) {
+	var res probeResult
+
 	sb := backend.NewStdio(be.Name, be.Command, envExtra)
 	if err := sb.Start(ctx); err != nil {
-		return fmt.Errorf("start: %w", err)
+		return res, fmt.Errorf("start: %w", err)
 	}
 	defer sb.Close()
 
 	conn := sb.Conn()
+
+	// Read responses on a goroutine so a backend that never replies is bounded by
+	// the context deadline rather than blocking Read forever. One reader serves
+	// the whole probe sequence (initialize, then tools/list).
+	//
+	// read skips server-initiated traffic and returns only the response whose id
+	// matches wantID. A backend may emit a notification (server-everything sends
+	// notifications/tools/list_changed right after initialize) or a server→client
+	// request before answering ours; a naive single Read would mistake one of
+	// those for the response — reporting "not an MCP server" or 0 tools (the bug
+	// fixed for the broker handshake in commit 7524818). The whole loop, including
+	// each Read, stays bounded by the context deadline.
+	type readResult struct {
+		m   *mcp.Message
+		err error
+	}
+	read := func(wantID json.RawMessage) (*mcp.Message, error) {
+		for {
+			ch := make(chan readResult, 1)
+			go func() {
+				m, err := conn.Read()
+				ch <- readResult{m, err}
+			}()
+			var r readResult
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case r = <-ch:
+			}
+			if r.err != nil {
+				return nil, r.err
+			}
+			// Skip server-initiated traffic: notifications (no id) and server
+			// requests (method + id) are not our response. A reply carries no
+			// method and an id; one bearing our id is the answer (even an empty
+			// result, so the "not an MCP server" check below still fires fast).
+			if r.m.Method != "" {
+				continue
+			}
+			if len(r.m.ID) == 0 {
+				continue
+			}
+			if bytes.Equal(bytes.TrimSpace(r.m.ID), bytes.TrimSpace(wantID)) {
+				return r.m, nil
+			}
+			// A response with a different id (out-of-order) — keep waiting.
+		}
+	}
 
 	params := json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"usher","version":"` + version + `"}}`)
 	req := &mcp.Message{
@@ -532,41 +1203,53 @@ func probeBackend(ctx context.Context, be *config.Backend, envExtra []string) er
 		Method:  "initialize",
 		Params:  params,
 	}
+	start := time.Now()
 	if err := conn.Write(req); err != nil {
-		return fmt.Errorf("write initialize: %w", err)
+		return res, fmt.Errorf("write initialize: %w", err)
 	}
 
-	// Read responses on a goroutine so a backend that never replies is bounded by
-	// the context deadline rather than blocking Read forever.
-	type readResult struct {
-		m   *mcp.Message
-		err error
+	m, err := read(req.ID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, fmt.Errorf("initialize: %w", ctx.Err())
+		}
+		return res, fmt.Errorf("read initialize response: %w", err)
 	}
-	ch := make(chan readResult, 1)
-	go func() {
-		m, err := conn.Read()
-		ch <- readResult{m, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("initialize: %w", ctx.Err())
-	case r := <-ch:
-		if r.err != nil {
-			return fmt.Errorf("read initialize response: %w", r.err)
-		}
-		if len(r.m.Error) > 0 {
-			return fmt.Errorf("initialize error: %s", r.m.Error)
-		}
-		if len(r.m.Result) == 0 {
-			return fmt.Errorf("initialize returned no result (not an MCP server?)")
-		}
+	res.Latency = time.Since(start)
+	if len(m.Error) > 0 {
+		return res, fmt.Errorf("initialize error: %s", m.Error)
+	}
+	if len(m.Result) == 0 {
+		return res, fmt.Errorf("initialize returned no result (not an MCP server?)")
 	}
 
 	// The backend speaks MCP. Send notifications/initialized so it can finish its
-	// handshake cleanly, then close. tools/list is exercised at serve time.
+	// handshake cleanly.
 	_ = conn.Write(&mcp.Message{JSONRPC: "2.0", Method: "notifications/initialized"})
-	return nil
+
+	// Count tools via tools/list. A backend without a tools capability may reply
+	// with an error or no result; that's not a probe failure (the handshake is
+	// what proves MCP), so we leave Tools at 0 and return success.
+	listReq := &mcp.Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("2"),
+		Method:  "tools/list",
+		Params:  json.RawMessage(`{}`),
+	}
+	if err := conn.Write(listReq); err != nil {
+		return res, nil // handshake already proved MCP; report what we have
+	}
+	lm, err := read(listReq.ID)
+	if err != nil || lm == nil || len(lm.Error) > 0 || len(lm.Result) == 0 {
+		return res, nil
+	}
+	var listResult struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if json.Unmarshal(lm.Result, &listResult) == nil {
+		res.Tools = len(listResult.Tools)
+	}
+	return res, nil
 }
 
 // readSecret reads a single secret line from the terminal with echo disabled, so

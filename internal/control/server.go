@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -38,17 +39,22 @@ const EnvAddr = "USHER_UI_ADDR"
 // live-connection registry (also Hub-fed) for GET /api/connections. cfgJSON is
 // the redacted config the UI shows; it is captured once at construction.
 type Server struct {
-	bus  *broker.Hub
-	sv   *broker.BackendSupervisor
-	reg  *connRegistry
-	res  *resourceState
-	mux  *http.ServeMux
-	addr string
+	bus     *broker.Hub
+	sv      *broker.BackendSupervisor
+	reg     *connRegistry
+	res     *resourceState
+	metrics *metricsState
+	mux     *http.ServeMux
+	addr    string
 
 	// cfgSnapshot is the config view served by GET /api/config, captured at New so
 	// the handler never re-reads disk on the hot path. It carries no secrets (the
 	// config type already keeps secret VALUES out — only env var NAMES appear).
 	cfgSnapshot any
+
+	// startedAt is the server's construction time, used by GET /healthz to report
+	// uptime. It is captured once at New so the liveness probe stays a cheap read.
+	startedAt time.Time
 }
 
 // New builds a control server over the broker's event bus and shared backend
@@ -64,8 +70,10 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 		sv:          sv,
 		reg:         newConnRegistry(),
 		res:         newResourceState(),
+		metrics:     newMetricsState(),
 		mux:         http.NewServeMux(),
 		cfgSnapshot: cfgSnapshot,
+		startedAt:   time.Now(),
 	}
 	s.routes()
 	return s
@@ -76,10 +84,12 @@ func New(bus *broker.Hub, sv *broker.BackendSupervisor, cfgSnapshot any) *Server
 // routing needs no third-party router.
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleIndex)
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/backends", s.handleBackends)
 	s.mux.HandleFunc("GET /api/connections", s.handleConnections)
 	s.mux.HandleFunc("GET /api/resources", s.handleResources)
 	s.mux.HandleFunc("GET /api/config", s.handleConfig)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET /api/events", s.handleEvents)
 	s.mux.HandleFunc("POST /api/backends/{name}/start", s.manage((*broker.BackendSupervisor).Start))
 	s.mux.HandleFunc("POST /api/backends/{name}/stop", s.manage((*broker.BackendSupervisor).Stop))
@@ -120,6 +130,7 @@ func (s *Server) SetAddr(addr string) { s.addr = addr }
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go s.reg.Watch(ctx, s.bus)
 	go s.res.Watch(ctx, s.bus)
+	go s.metrics.Watch(ctx, s.bus)
 
 	srv := &http.Server{
 		Handler:           s.mux,
@@ -182,6 +193,56 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		cfg = struct{}{}
 	}
 	writeJSON(w, http.StatusOK, cfg)
+}
+
+// healthz is the JSON body GET /healthz returns: a fixed "ok" status plus a few
+// cheap, already-available liveness counters — the daemon pid, seconds since the
+// control server was constructed, and the count of configured backends and live
+// agent connections. It is a probe payload, never authoritative state; the rich
+// listings live behind /api/backends and /api/connections.
+type healthz struct {
+	Status        string `json:"status"`
+	PID           int    `json:"pid"`
+	UptimeSeconds int64  `json:"uptimeSeconds"`
+	Backends      int    `json:"backends"`
+	Connections   int    `json:"connections"`
+}
+
+// handleHealthz answers GET /healthz with a 200 and the healthz probe payload. It
+// touches only counters already on hand — the supervisor's backend count and the
+// connection registry's live size — so it stays a cheap liveness check that never
+// blocks on the broker or re-reads disk. A nil supervisor reports zero backends so
+// a bare server (no daemon behind it) still answers a clean 200.
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	backends := 0
+	if s.sv != nil {
+		backends = len(s.sv.Snapshot())
+	}
+	writeJSON(w, http.StatusOK, healthz{
+		Status:        "ok",
+		PID:           os.Getpid(),
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		Backends:      backends,
+		Connections:   len(s.reg.snapshot()),
+	})
+}
+
+// handleMetrics answers GET /metrics with the broker counters in Prometheus text
+// exposition format (plaintext "key value" lines, no client library). The
+// counters are read-only observations folded off the SAME event bus the broker
+// already emits to, so scraping never touches the forwarding hot path; the
+// backends-configured gauge is read live from the supervisor here (it is config,
+// not an event counter, and a nil supervisor reports zero — a bare test server).
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	backends := 0
+	if s.sv != nil {
+		backends = len(s.sv.Snapshot())
+	}
+	// Prometheus text format is UTF-8 text/plain version 0.0.4; a plain scraper or
+	// `grep` reads it either way.
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(s.metrics.render(backends)))
 }
 
 // manage builds a POST handler for a lifecycle action (Start/Stop/Restart),
